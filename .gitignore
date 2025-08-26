@@ -1,0 +1,7 @@
+.idea/
+# Ignore everything in tests/
+tests/*
+
+# Allow Python and C source files
+!tests/**/*.py
+!tests/**/*.c
