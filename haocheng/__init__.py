@@ -27,6 +27,8 @@ class RuntimeFeedback(BaseModel):
     watchpoints: dict[str, list[dict[str, str]]]
     # dict["file:line", list(occurrence)["backtrace string"]]
     breakpoints: dict[str, list[str]]
+    stdout: bytes
+    stderr: bytes
 
 
 # Helper to find a DAP adapter (lldb)
@@ -98,16 +100,21 @@ async def _run_dap(
     if env is None:
         env: Dict[str, str] = dict(os.environ)
 
-    tmp_file: tempfile.NamedTemporaryFile | None = None
+    stdin: tempfile.NamedTemporaryFile | None = None
+    stdout = tempfile.NamedTemporaryFile(delete=False)
+    stderr = tempfile.NamedTemporaryFile(delete=False)
     try:
-        stdio_commands = []
+        stdio_commands = [
+            f"settings set target.output-path {stdout.name}",
+            f"settings set target.error-path {stderr.name}",
+        ]
         if stdin_bytes is not None:
-            tmp_file = tempfile.NamedTemporaryFile(delete=False)
-            tmp_file.write(stdin_bytes)
-            tmp_file.flush()
-            tmp_file.close()
-            stdio_commands = [
-                f"settings set target.input-path {tmp_file.name}",
+            stdin = tempfile.NamedTemporaryFile(delete=False)
+            stdin.write(stdin_bytes)
+            stdin.flush()
+            stdin.close()
+            stdio_commands += [
+                f"settings set target.input-path {stdin.name}",
             ]
 
         launch_args = LaunchRequestArguments(
@@ -143,7 +150,7 @@ async def _run_dap(
                     )
 
         # Aggregate results
-        result = RuntimeFeedback(watchpoints={}, breakpoints={})
+        result = RuntimeFeedback(watchpoints={}, breakpoints={}, stdout=b"", stderr=b"")
 
         # Map watchpoints by location for quicker lookup
         wps_by_loc: Dict[str, List[WatchPoint]] = {}
@@ -204,20 +211,30 @@ async def _run_dap(
 
         # Graceful shutdown
         await dbg.terminate()
+        with open(stdout.name, "rb") as f:
+            result.stdout = f.read()
+        with open(stderr.name, "rb") as f:
+            result.stderr = f.read()
         return result
     finally:
-        if tmp_file is not None:
+        if stdin is not None:
             try:
-                os.unlink(tmp_file.name)
+                os.unlink(stdin.name)
             except Exception:
                 pass
-
+        try:
+            os.unlink(stdout.name)
+            os.unlink(stderr.name)
+        except Exception:
+            pass
 
 def get_runtime_feedback(
         cmd: List[str],
         stdin: bytes | None,
         watchpoints_list: List[Dict[str, Any]],
         monitor_locations: List[str],
+        cwd: Path = None,
+        env: Dict[str, str] = None
 ) -> RuntimeFeedback:
     """
     Launch the process under LLDB via DAP and collect runtime feedback.

@@ -12,7 +12,7 @@ int work_basic(int n) {
 int main(void) {
     int n = 5;
     int s = work_basic(n);
-    printf("sum=%d\n", s);
+    fprintf(stderr, "sum=%d\n", s);
     return 0;
 }
 

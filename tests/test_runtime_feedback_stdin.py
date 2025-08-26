@@ -37,3 +37,4 @@ def test_runtime_feedback_stdin():
     joined = "\n".join(res.breakpoints[loc])
     assert "work_stdin" in joined
     assert "main" in joined
+    assert b"acc=24\n" == res.stdout

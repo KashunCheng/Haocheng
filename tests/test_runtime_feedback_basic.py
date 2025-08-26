@@ -39,3 +39,4 @@ def test_runtime_feedback_basic():
     joined = "\n".join(res.breakpoints[loc])
     assert "work_basic" in joined
     assert "main" in joined
+    assert b"sum=10\n" == res.stderr
