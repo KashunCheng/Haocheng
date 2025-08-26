@@ -33,11 +33,14 @@ class RuntimeFeedback(BaseModel):
 
 
 # Helper to find a DAP adapter (lldb)
-def _find_lldb_adapter() -> Tuple[str, List[str]]:
+def _find_lldb_adapter(lldb_path: Path = None) -> Tuple[str, List[str]]:
     """Return (cmd, args) to launch an LLDB DAP adapter.
 
     Tries `lldb-dap` then `lldb-vscode` from PATH.
     """
+    if lldb_path.exists():
+        return str(lldb_path), []
+
     import shutil
 
     for name in ("lldb-dap", "lldb-vscode"):
@@ -94,7 +97,8 @@ async def _run_dap(
         watchpoints_list: List[Dict[str, Any]],
         monitor_locations: List[str],
         repo_dir: Path = None,
-        env: Dict[str, str] = None
+        env: Dict[str, str] = None,
+        lldb_path: Path = None,
 ) -> RuntimeFeedback:
     # Prepare launch config and env (stdin fallback via file if provided)
     program = str(Path(cmd[0]).resolve())
@@ -134,7 +138,7 @@ async def _run_dap(
         )
 
         # Prepare adapter
-        adapter_cmd, adapter_args = _find_lldb_adapter()
+        adapter_cmd, adapter_args = _find_lldb_adapter(lldb_path=lldb_path)
         factory = DAPClientSingletonFactory(adapter_cmd, adapter_args)
         dbg = Debugger(factory=factory, launch_arguments=launch_args)
 
@@ -251,7 +255,8 @@ def get_runtime_feedback(
         watchpoints_list: List[Dict[str, Any]],
         monitor_locations: List[str],
         repo_dir: Path = None,
-        env: Dict[str, str] = None
+        env: Dict[str, str] = None,
+        lldb_path: Path = None,
 ) -> RuntimeFeedback:
     """
     Launch the process under LLDB via DAP and collect runtime feedback.
@@ -262,4 +267,4 @@ def get_runtime_feedback(
     - monitor_locations: list of "file:line" at which to set breakpoints.
     """
 
-    return asyncio.run(_run_dap(cmd, stdin, watchpoints_list, monitor_locations, repo_dir, env))
+    return asyncio.run(_run_dap(cmd, stdin, watchpoints_list, monitor_locations, repo_dir, env, lldb_path))
