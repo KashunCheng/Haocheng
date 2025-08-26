@@ -10,17 +10,12 @@ def test_runtime_feedback_stdin():
     src = ROOT / "fixtures" / "loop_stdin.c"
     bin_path = _compile_fixture(src)
 
-    loc = "fixtures/loop_stdin.c:13"
+    loc = f"{src}:13"
     watchpoints = [
         {"var": "i", "log_location": loc},
         {"var": "acc", "log_location": loc},
     ]
-    # Feed stdin bytes; implementation uses robust env-file fallback
-    try:
-        res = get_runtime_feedback([str(bin_path)], b"4\n", watchpoints, [loc])
-    except Exception as e:
-        pytest.skip(f"Skipping due to sandboxed debug launch: {e}")
-        return
+    res = get_runtime_feedback([str(bin_path)], b"4\n", watchpoints, [loc])
 
     # Expect 4 iterations (1..4)
     assert loc in res.breakpoints

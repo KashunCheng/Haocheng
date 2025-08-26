@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from dap_types import StoppedEvent
 from pydantic import BaseModel
 
 from dap_mcp.factory import DAPClientSingletonFactory
@@ -49,25 +50,30 @@ def _find_lldb_adapter() -> Tuple[str, List[str]]:
 
 
 def _normalize_locations(
-        monitor_locations: List[str],
-) -> Tuple[Dict[Tuple[str, int], str], Dict[str, List[int]]]:
-    """Return mappings for locations.
-
-    - abs_to_rel[(abs_path, line)] -> rel_key ("file:line")
-    - file_to_lines[abs_path] -> [line,...] for setBreakpoints grouping
+        locations: List[str],
+        repo_dir: Path = None
+) -> Tuple[Dict[str, Tuple[str, int]], List[Tuple[str, int]]]:
+    """Return a list of (location, line_no) tuples.
     """
-    abs_to_rel: Dict[Tuple[str, int], str] = {}
-    file_to_lines: Dict[str, List[int]] = {}
-    for loc in monitor_locations:
+    location_to_normalized_location: dict[str, Tuple[str, int]] = {}
+    result = []
+    for loc in locations:
         file_part, line_part = loc.rsplit(":", 1)
-        rel_key = f"{file_part}:{int(line_part)}"
-        abs_path = str(Path(file_part).resolve())
-        line = int(line_part)
-        abs_to_rel[(abs_path, line)] = rel_key
-        file_to_lines.setdefault(abs_path, [])
-        if line not in file_to_lines[abs_path]:
-            file_to_lines[abs_path].append(line)
-    return abs_to_rel, file_to_lines
+        file_part = Path(file_part)
+        if file_part.is_absolute():
+            assert file_part.exists()
+            location_to_normalized_location[loc] = (str(file_part.resolve()), int(line_part))
+            result.append((str(file_part.resolve()), int(line_part)))
+            continue
+        if repo_dir is not None:
+            guess_dir = repo_dir / file_part
+            if guess_dir.exists():
+                location_to_normalized_location[loc] = (str(guess_dir.resolve()), int(line_part))
+                result.append((str(guess_dir.resolve()), int(line_part)))
+                continue
+        location_to_normalized_location[loc] = (str(file_part), int(line_part))
+        result.append((str(file_part), int(line_part)))
+    return location_to_normalized_location, result
 
 
 def _compact_backtrace(frames) -> str:
@@ -87,14 +93,12 @@ async def _run_dap(
         stdin_bytes: bytes | None,
         watchpoints_list: List[Dict[str, Any]],
         monitor_locations: List[str],
-        cwd: Path = None,
+        repo_dir: Path = None,
         env: Dict[str, str] = None
 ) -> RuntimeFeedback:
     # Prepare launch config and env (stdin fallback via file if provided)
     program = str(Path(cmd[0]).resolve())
     args = cmd[1:]
-    if cwd is None:
-        cwd = str(Path.cwd())
 
     # Stdin strategy: robust fallback via env file
     if env is None:
@@ -135,29 +139,35 @@ async def _run_dap(
         dbg = Debugger(factory=factory, launch_arguments=launch_args)
 
         await dbg.initialize()
-
-        abs_to_rel, file_to_lines = _normalize_locations(monitor_locations)
+        locations = list(set(monitor_locations).union(set(map(lambda d: d["log_location"], watchpoints_list))))
+        location_to_normalized_location, normalized_locations = _normalize_locations(locations, repo_dir)
+        breakpoints_id_to_location: Dict[int, Tuple[str, int]] = {}
+        location_to_breakpoint_id: Dict[Tuple[str, int], int] = {}
 
         # Set all breakpoints before launch
-        for abs_file, lines in file_to_lines.items():
-            for line in lines:
-                resp = await dbg.set_breakpoint(Path(abs_file), line)
-                if isinstance(resp, (SetBreakpointsResponse, ErrorResponse)) and isinstance(
-                        resp, ErrorResponse
-                ):
-                    raise RuntimeError(
-                        f"Failed to set breakpoint at {abs_file}:{line}: {resp.message}"
-                    )
+        for file, line in normalized_locations:
+            resp = await dbg.set_breakpoint(Path(file), line)
+            if isinstance(resp, (SetBreakpointsResponse, ErrorResponse)) and isinstance(
+                    resp, ErrorResponse
+            ):
+                raise RuntimeError(
+                    f"Failed to set breakpoint at {file}:{line}: {resp.message}"
+                )
+            assert resp.success is True
+            current_breakpoint = resp.body.breakpoints[-1]
+            breakpoints_id_to_location[current_breakpoint.id] = (file, line)
+            location_to_breakpoint_id[(file, line)] = current_breakpoint.id
 
         # Aggregate results
         result = RuntimeFeedback(watchpoints={}, breakpoints={}, stdout=b"", stderr=b"")
 
         # Map watchpoints by location for quicker lookup
-        wps_by_loc: Dict[str, List[WatchPoint]] = {}
+        wps_by_id: Dict[int, List[str]] = {}
         for wp in watchpoints_list:
             w = WatchPoint(**wp)
-            key = f"{w.log_location.split(':')[0]}:{int(w.log_location.split(':')[1])}"
-            wps_by_loc.setdefault(key, []).append(w)
+            loc = location_to_normalized_location[w.log_location]
+            breakpoint_id = location_to_breakpoint_id[loc]
+            wps_by_id.setdefault(breakpoint_id, []).append(w.var)
 
         # Launch and event loop
         stopped = await dbg.launch()
@@ -175,29 +185,35 @@ async def _run_dap(
                 stopped = next_view
                 continue
 
+            breakpoint_event = list(
+                filter(lambda e: isinstance(e, StoppedEvent) and e.body.reason == 'breakpoint', stopped.events.events))
+            if not breakpoint_event:
+                next_view = await dbg.continue_execution()
+                stopped = next_view
+                continue
+            assert len(breakpoint_event) == 1
+            breakpoint_ids = breakpoint_event[0].body.hitBreakpointIds
+
             top = frames[0]
-            src_path = (
-                str(Path(top.source.path).resolve()) if top.source and top.source.path else ""
-            )
-            site = (src_path, int(getattr(top, "line", 0) or 0))
-            rel_key = abs_to_rel.get(site)
+            site = f'{top.source.path}:{top.line}'
             # Collect backtrace string regardless; but only store if monitored
             bt = _compact_backtrace(frames)
-            if rel_key:
-                result.breakpoints.setdefault(rel_key, []).append(bt)
-                # Evaluate watchpoints for this location
-                for w in wps_by_loc.get(rel_key, []):
+            result.breakpoints.setdefault(site, []).append(bt)
+            # Evaluate watchpoints for this location
+            for breakpoint_id in breakpoint_ids:
+                for var in wps_by_id[breakpoint_id]:
                     try:
-                        ev = await dbg.evaluate(w.var)
-                        val = (
-                            ev.body.result
-                            if hasattr(ev, "body") and hasattr(ev.body, "result")
-                            else "<unavailable>"
-                        )
+                        ev = await dbg.evaluate(var)
+                        if ev.success:
+                            val = (
+                                ev.body.result
+                            )
+                        else:
+                            val = ev.body.error
                     except Exception:
                         val = "<unavailable>"
-                    result.watchpoints.setdefault(rel_key, []).append(
-                        {"var": w.var, "value": str(val)}
+                    result.watchpoints.setdefault(site, []).append(
+                        {"var": var, "value": str(val)}
                     )
 
             # Continue
@@ -228,12 +244,13 @@ async def _run_dap(
         except Exception:
             pass
 
+
 def get_runtime_feedback(
         cmd: List[str],
         stdin: bytes | None,
         watchpoints_list: List[Dict[str, Any]],
         monitor_locations: List[str],
-        cwd: Path = None,
+        repo_dir: Path = None,
         env: Dict[str, str] = None
 ) -> RuntimeFeedback:
     """
@@ -245,4 +262,4 @@ def get_runtime_feedback(
     - monitor_locations: list of "file:line" at which to set breakpoints.
     """
 
-    return asyncio.run(_run_dap(cmd, stdin, watchpoints_list, monitor_locations))
+    return asyncio.run(_run_dap(cmd, stdin, watchpoints_list, monitor_locations, repo_dir, env))
