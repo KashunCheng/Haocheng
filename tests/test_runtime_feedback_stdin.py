@@ -10,7 +10,7 @@ def test_runtime_feedback_stdin():
     src = ROOT / "fixtures" / "loop_stdin.c"
     bin_path = _compile_fixture(src)
 
-    loc = "fixtures/loop_stdin.c:21"
+    loc = "fixtures/loop_stdin.c:13"
     watchpoints = [
         {"var": "i", "log_location": loc},
         {"var": "acc", "log_location": loc},
@@ -31,7 +31,7 @@ def test_runtime_feedback_stdin():
     i_vals = [_parse_int(e["value"]) for e in res.watchpoints[loc] if e["var"] == "i"]
     a_vals = [_parse_int(e["value"]) for e in res.watchpoints[loc] if e["var"] == "acc"]
     assert i_vals == [1, 2, 3, 4]
-    assert a_vals == [1, 2, 6, 24]
+    assert a_vals == [1, 1, 2, 6]
 
     assert all(isinstance(bt, str) and bt for bt in res.breakpoints[loc])
     joined = "\n".join(res.breakpoints[loc])

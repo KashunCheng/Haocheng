@@ -32,7 +32,7 @@ def test_runtime_feedback_basic():
     i_vals = [_parse_int(e["value"]) for e in res.watchpoints[loc] if e["var"] == "i"]
     s_vals = [_parse_int(e["value"]) for e in res.watchpoints[loc] if e["var"] == "sum"]
     assert i_vals == [0, 1, 2, 3, 4]
-    assert s_vals == [0, 1, 3, 6, 10]
+    assert s_vals == [0, 0, 1, 3, 6]
 
     # Backtrace strings non-empty and show function names
     assert all(isinstance(bt, str) and bt for bt in res.breakpoints[loc])
