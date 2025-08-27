@@ -536,16 +536,101 @@ class RuntimeDebugger:
     def get_runtime_feedback(
             self,
             cmd: List[str],
-            stdin: Optional[bytes],
-            watchpoint_locations: List[Dict[str, Any]],
-            breakpoint_locations: List[str],
-    ) -> RuntimeFeedback:
+            stdin: Optional[bytes] = None,
+            timeout_sec: Optional[int] = None,  # currently unused; reserved for future timeouts
+            breakpoints: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         """
-        Launch the process under LLDB via DAP and collect runtime feedback.
+        Run program under LLDB DAP and return feedback in the new schema.
 
-        - cmd: argv for the compiled C program (absolute or cwd-relative path first).
-        - stdin: optional bytes to feed to program (handled via env file fallback).
-        - watchpoint_locations: list of {"var": <expr>, "log_location": "file:line"}.
-        - breakpoint_locations: list of "file:line" at which to set breakpoints.
+        Args:
+        - cmd: program argv (first item is path to binary)
+        - stdin: optional bytes to feed to the program
+        - timeout_sec: optional timeout (not enforced yet)
+        - breakpoints: list of breakpoint specs matching BreakpointSpec
+
+        Returns a dict matching RuntimeFeedbackV2 schema.
         """
-        return asyncio.run(self._run_dap_async(cmd, stdin, watchpoint_locations, breakpoint_locations))
+        if not breakpoints:
+            breakpoints = []
+
+        # Convert new breakpoint schema into internal watchpoints and monitor locations
+        wp_list, monitor_locations, hit_limit_by_loc, stack_flag_by_loc = _convert_breakpoint_specs(breakpoints)
+
+        # Execute via existing DAP runner to collect raw data
+        raw = asyncio.run(self._run_dap_async(cmd, stdin, wp_list, monitor_locations))
+
+        # Build report per monitor location
+        reports: List[BreakpointReport] = []
+
+        # Helper to parse file path and line from location string
+        def parse_loc(loc: str) -> tuple[str, int]:
+            try:
+                f, ln = loc.rsplit(":", 1)
+                return f, int(ln)
+            except Exception:
+                return loc, 0
+
+        # Helper to extract function name from compact backtrace
+        def fn_from_bt(bt: str) -> str:
+            # Expected format: "f1() -> f2() -> f3() @ file:line"
+            try:
+                head = bt.split(" @ ", 1)[0]
+                first = head.split(" -> ", 1)[0]
+                return first.rstrip("()").strip()
+            except Exception:
+                return ""
+
+        # For deterministic ordering, iterate using the input monitor_locations
+        for idx, loc in enumerate(monitor_locations, start=1):
+            bts = raw.breakpoints.get(loc) or []
+            file_path, line_no = parse_loc(loc)
+            hit_limit = hit_limit_by_loc.get(loc, 10)
+            want_stack = stack_flag_by_loc.get(loc, False)
+
+            # Inline expr names configured for this location
+            expr_names = [wp["var"] for wp in wp_list if wp["log_location"] == loc]
+            per_hit_expr_count = len(expr_names)
+
+            # Collect inline expr values grouped per hit
+            flat_values = [e for e in (raw.watchpoints.get(loc) or []) if e.get("var") in expr_names]
+            grouped_values: List[List[InlineExprValue]] = []
+            if per_hit_expr_count > 0:
+                # Chunk the flat list into groups of per_hit_expr_count
+                for start in range(0, min(len(flat_values), hit_limit * per_hit_expr_count), per_hit_expr_count):
+                    chunk = flat_values[start:start + per_hit_expr_count]
+                    grouped_values.append([
+                        InlineExprValue(name=str(v.get("var", "")), value=str(v.get("value", ""))) for v in chunk
+                    ])
+            else:
+                # No inline expressions; still may have hits
+                for _ in range(min(len(bts), hit_limit)):
+                    grouped_values.append([])
+
+            # Align callstacks with grouped values by hit index
+            hits_info: List[BreakpointHitInfo] = []
+            total_hits = min(len(bts), hit_limit)
+            for i in range(total_hits):
+                callstack_str = bts[i] if want_stack and i < len(bts) else ""
+                exprs = grouped_values[i] if i < len(grouped_values) else []
+                hits_info.append(BreakpointHitInfo(callstack=callstack_str, inline_expr=exprs))
+
+            function_name = fn_from_bt(bts[0]) if bts else ""
+            report = BreakpointReport(
+                id=idx,
+                file_path=file_path,
+                line=line_no,
+                function_name=function_name,
+                hit_times=total_hits,
+                hits_info=hits_info,
+            )
+            reports.append(report)
+
+        # Prepare final output; exit_code/signal are currently 0 until extended
+        out = RuntimeFeedbackV2(
+            stderr=(raw.stderr.decode(errors="replace") if isinstance(raw.stderr, (bytes, bytearray)) else str(raw.stderr)),
+            exit_code=0,
+            signal=0,
+            breakpoints=reports,
+        )
+        return out.model_dump()

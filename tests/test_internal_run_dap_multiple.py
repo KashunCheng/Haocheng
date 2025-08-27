@@ -50,3 +50,4 @@ async def test_runtime_feedback_multiple():
     assert "work_multiple" in joined
     assert "main" in joined
     assert b"sum=15\n" == res.stdout
+
