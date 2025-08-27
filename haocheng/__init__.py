@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Tuple, Optional
 
 try:
     from dap_types import StoppedEvent
-    from pydantic import BaseModel
+    from pydantic import BaseModel, Field
     from dap_mcp.factory import DAPClientSingletonFactory
     from dap_mcp.debugger import (
         Debugger,
@@ -38,6 +38,8 @@ except ImportError as e:
     LaunchRequestArguments = None
     SetBreakpointsResponse = None
     ErrorResponse = None
+    def Field(**kwargs):
+        return []
 
 
 class WatchPoint(BaseModel):
@@ -52,6 +54,88 @@ class RuntimeFeedback(BaseModel):
     breakpoints: dict[str, list[str]]
     stdout: bytes
     stderr: bytes
+
+
+# New Pydantic models for the updated API schema
+class BreakpointSpec(BaseModel):
+    """Breakpoint request schema.
+
+    location: "filename:line"
+    hit_limit: integer (default 10)
+    inline_expr: optional list of expressions to evaluate on hit
+    print_call_stack: whether to include call stack string per hit
+    """
+
+    location: str
+    hit_limit: int = 10
+    inline_expr: list[str] = Field(default_factory=list)
+    print_call_stack: bool = False
+
+
+class InlineExprValue(BaseModel):
+    name: str
+    value: str
+
+
+class BreakpointHitInfo(BaseModel):
+    callstack: str
+    inline_expr: list[InlineExprValue]
+
+
+class BreakpointReport(BaseModel):
+    id: int
+    file_path: str
+    line: int
+    function_name: str
+    hit_times: int
+    hits_info: list[BreakpointHitInfo]
+
+
+class RuntimeFeedbackV2(BaseModel):
+    """Output schema for get_runtime_feedback (new format)."""
+
+    stderr: str
+    exit_code: int
+    signal: int
+    breakpoints: list[BreakpointReport]
+
+
+def _convert_breakpoint_specs(
+    specs: List[Dict[str, Any]] | List[BreakpointSpec],
+) -> Tuple[List[Dict[str, str]], List[str], Dict[str, int], Dict[str, bool]]:
+    """Convert BreakpointSpec list into internal watchpoints + monitor locations.
+
+    Returns:
+    - watchpoints_list: list of {"var", "log_location"}
+    - monitor_locations: list of "file:line" locations (deduplicated, insertion order preserved)
+    - hit_limit_by_loc: dict mapping location -> hit_limit
+    - stack_flag_by_loc: dict mapping location -> print_call_stack
+    """
+    wp_list: List[Dict[str, str]] = []
+    monitor_locations: List[str] = []
+    seen: set[str] = set()
+    hit_limit_by_loc: Dict[str, int] = {}
+    stack_flag_by_loc: Dict[str, bool] = {}
+
+    for item in specs:
+        # Allow dicts or model instances
+        if isinstance(item, dict):
+            bp = BreakpointSpec(**item)
+        else:
+            bp = item  # type: ignore[assignment]
+
+        loc = bp.location
+        if loc not in seen:
+            monitor_locations.append(loc)
+            seen.add(loc)
+        hit_limit_by_loc[loc] = int(bp.hit_limit) if bp.hit_limit is not None else 10
+        stack_flag_by_loc[loc] = bool(bp.print_call_stack)
+
+        if bp.inline_expr:
+            for expr in bp.inline_expr:
+                wp_list.append({"var": str(expr), "log_location": loc})
+
+    return wp_list, monitor_locations, hit_limit_by_loc, stack_flag_by_loc
 
 
 # Helper to find a DAP adapter (lldb)
