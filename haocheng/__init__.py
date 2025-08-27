@@ -38,6 +38,8 @@ except ImportError as e:
     LaunchRequestArguments = None
     SetBreakpointsResponse = None
     ErrorResponse = None
+
+
     def Field(**kwargs):
         return []
 
@@ -98,44 +100,6 @@ class RuntimeFeedbackV2(BaseModel):
     exit_code: int
     signal: int
     breakpoints: list[BreakpointReport]
-
-
-def _convert_breakpoint_specs(
-    specs: List[Dict[str, Any]] | List[BreakpointSpec],
-) -> Tuple[List[Dict[str, str]], List[str], Dict[str, int], Dict[str, bool]]:
-    """Convert BreakpointSpec list into internal watchpoints + monitor locations.
-
-    Returns:
-    - watchpoints_list: list of {"var", "log_location"}
-    - monitor_locations: list of "file:line" locations (deduplicated, insertion order preserved)
-    - hit_limit_by_loc: dict mapping location -> hit_limit
-    - stack_flag_by_loc: dict mapping location -> print_call_stack
-    """
-    wp_list: List[Dict[str, str]] = []
-    monitor_locations: List[str] = []
-    seen: set[str] = set()
-    hit_limit_by_loc: Dict[str, int] = {}
-    stack_flag_by_loc: Dict[str, bool] = {}
-
-    for item in specs:
-        # Allow dicts or model instances
-        if isinstance(item, dict):
-            bp = BreakpointSpec(**item)
-        else:
-            bp = item  # type: ignore[assignment]
-
-        loc = bp.location
-        if loc not in seen:
-            monitor_locations.append(loc)
-            seen.add(loc)
-        hit_limit_by_loc[loc] = int(bp.hit_limit) if bp.hit_limit is not None else 10
-        stack_flag_by_loc[loc] = bool(bp.print_call_stack)
-
-        if bp.inline_expr:
-            for expr in bp.inline_expr:
-                wp_list.append({"var": str(expr), "log_location": loc})
-
-    return wp_list, monitor_locations, hit_limit_by_loc, stack_flag_by_loc
 
 
 # Helper to find a DAP adapter (lldb)
@@ -210,8 +174,7 @@ def _compact_backtrace(frames) -> str:
 async def _run_dap(
         cmd: List[str],
         stdin_bytes: Optional[bytes],
-        watchpoint_locations: List[Dict[str, Any]],
-        breakpoint_locations: List[str],
+        breakpoints: List[BreakpointSpec],
         repo_dir: Optional[Path] = None,
         env: Optional[Dict[str, str]] = None,
         lldb_path: Optional[Path] = None,
@@ -266,8 +229,14 @@ async def _run_dap(
         dbg = Debugger(factory=factory, launch_arguments=launch_args)
 
         await dbg.initialize()
-        locations = list(set(breakpoint_locations).union(set(map(lambda d: d["log_location"], watchpoint_locations))))
-        location_to_normalized_location, normalized_locations = _normalize_locations(locations, repo_dir)
+        # Normalize and set breakpoints for all locations provided in specs
+        locs_in_order = []
+        seen_locs: set[str] = set()
+        for bp in breakpoints:
+            if bp.location not in seen_locs:
+                locs_in_order.append(bp.location)
+                seen_locs.add(bp.location)
+        location_to_normalized_location, normalized_locations = _normalize_locations(locs_in_order, repo_dir)
         breakpoints_id_to_location: Dict[int, Tuple[str, int]] = {}
         location_to_breakpoint_id: Dict[Tuple[str, int], int] = {}
 
@@ -292,13 +261,13 @@ async def _run_dap(
         # Aggregate results
         result = RuntimeFeedback(watchpoints={}, breakpoints={}, stdout=b"", stderr=b"")
 
-        # Map watchpoints by location for quicker lookup
+        # Map inline expressions by breakpoint id
         wps_by_id: Dict[int, List[str]] = {}
-        for wp in watchpoint_locations:
-            w = WatchPoint(**wp)
-            loc = location_to_normalized_location[w.log_location]
-            breakpoint_id = location_to_breakpoint_id[loc]
-            wps_by_id.setdefault(breakpoint_id, []).append(w.var)
+        for spec in breakpoints:
+            loc_key = location_to_normalized_location[spec.location]
+            bp_id = location_to_breakpoint_id[loc_key]
+            exprs = list(spec.inline_expr or [])
+            wps_by_id[bp_id] = exprs
 
         # Launch and event loop
         stopped = await dbg.launch()
@@ -370,9 +339,12 @@ async def _run_dap(
             stopped = next_view
 
         # Ensure keys exist even if never hit
-        for loc in breakpoint_locations:
-            result.breakpoints.setdefault(loc, [])
-            result.watchpoints.setdefault(loc, [])
+        for loc in locs_in_order:
+            # Normalize to absolute site string format matching event site
+            abs_loc = location_to_normalized_location.get(loc)
+            site_key = f"{abs_loc[0]}:{abs_loc[1]}" if abs_loc else loc
+            result.breakpoints.setdefault(site_key, [])
+            result.watchpoints.setdefault(site_key, [])
 
         # Graceful shutdown
         await dbg.terminate()
@@ -519,15 +491,13 @@ class RuntimeDebugger:
             self,
             cmd: List[str],
             stdin_bytes: Optional[bytes],
-            watchpoint_locations: List[Dict[str, Any]],
-            breakpoint_locations: List[str],
+            breakpoints: List[BreakpointSpec],
     ) -> RuntimeFeedback:
         """Async version of runtime debugging."""
         return await _run_dap(
             cmd,
             stdin_bytes,
-            watchpoint_locations,
-            breakpoint_locations,
+            breakpoints,
             self.repo_dir,
             self.env,
             self.lldb_path
@@ -554,11 +524,18 @@ class RuntimeDebugger:
         if not breakpoints:
             breakpoints = []
 
-        # Convert new breakpoint schema into internal watchpoints and monitor locations
-        wp_list, monitor_locations, hit_limit_by_loc, stack_flag_by_loc = _convert_breakpoint_specs(breakpoints)
+        # Parse breakpoint specs (dicts -> Pydantic models)
+        specs: List[BreakpointSpec] = []
+        hit_limit_by_loc: Dict[str, int] = {}
+        stack_flag_by_loc: Dict[str, bool] = {}
+        for item in breakpoints:
+            bp = BreakpointSpec(**item)
+            specs.append(bp)
+            hit_limit_by_loc[bp.location] = int(bp.hit_limit) if bp.hit_limit is not None else 10
+            stack_flag_by_loc[bp.location] = bool(bp.print_call_stack)
 
-        # Execute via existing DAP runner to collect raw data
-        raw = asyncio.run(self._run_dap_async(cmd, stdin, wp_list, monitor_locations))
+        # Execute via DAP runner to collect raw data
+        raw = asyncio.run(self._run_dap_async(cmd, stdin, specs))
 
         # Build report per monitor location
         reports: List[BreakpointReport] = []
@@ -581,15 +558,16 @@ class RuntimeDebugger:
             except Exception:
                 return ""
 
-        # For deterministic ordering, iterate using the input monitor_locations
-        for idx, loc in enumerate(monitor_locations, start=1):
+        # For deterministic ordering, iterate using the input breakpoints
+        for idx, bp_spec in enumerate(specs, start=1):
+            loc = bp_spec.location
             bts = raw.breakpoints.get(loc) or []
             file_path, line_no = parse_loc(loc)
             hit_limit = hit_limit_by_loc.get(loc, 10)
             want_stack = stack_flag_by_loc.get(loc, False)
 
-            # Inline expr names configured for this location
-            expr_names = [wp["var"] for wp in wp_list if wp["log_location"] == loc]
+            # Inline expr names configured for this location (preserve order)
+            expr_names = list(bp_spec.inline_expr or [])
             per_hit_expr_count = len(expr_names)
 
             # Collect inline expr values grouped per hit
@@ -628,7 +606,8 @@ class RuntimeDebugger:
 
         # Prepare final output; exit_code/signal are currently 0 until extended
         out = RuntimeFeedbackV2(
-            stderr=(raw.stderr.decode(errors="replace") if isinstance(raw.stderr, (bytes, bytearray)) else str(raw.stderr)),
+            stderr=(
+                raw.stderr.decode(errors="replace") if isinstance(raw.stderr, (bytes, bytearray)) else str(raw.stderr)),
             exit_code=0,
             signal=0,
             breakpoints=reports,

@@ -1,6 +1,6 @@
 import pytest
 
-from haocheng import _run_dap
+from haocheng import _run_dap, BreakpointSpec
 from tests import _which_lldb_adapter, _can_spawn_adapter, ROOT, _compile_fixture, _parse_int
 
 
@@ -12,11 +12,10 @@ async def test_runtime_feedback_stdin():
     bin_path = _compile_fixture(src)
 
     loc = f"{src}:13"
-    watchpoints = [
-        {"var": "i", "log_location": loc},
-        {"var": "acc", "log_location": loc},
+    specs = [
+        BreakpointSpec(location=loc, inline_expr=["i", "acc"], hit_limit=10, print_call_stack=True)
     ]
-    res = await _run_dap([str(bin_path)], b"4\n", watchpoints, [loc])
+    res = await _run_dap([str(bin_path)], b"4\n", specs)
 
     # Expect 4 iterations (1..4)
     assert loc in res.breakpoints
@@ -34,4 +33,3 @@ async def test_runtime_feedback_stdin():
     assert "work_stdin" in joined
     assert "main" in joined
     assert b"acc=24\n" == res.stdout
-

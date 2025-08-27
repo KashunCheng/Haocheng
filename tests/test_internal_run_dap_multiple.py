@@ -1,6 +1,6 @@
 import pytest
 
-from haocheng import _run_dap
+from haocheng import _run_dap, BreakpointSpec
 from tests import _which_lldb_adapter, _can_spawn_adapter, ROOT, _compile_fixture, _parse_int
 
 
@@ -13,13 +13,11 @@ async def test_runtime_feedback_multiple():
 
     loc1 = f"{src}:6"
     loc2 = f"{src}:7"
-    watchpoints = [
-        {"var": "i", "log_location": loc1},
-        {"var": "sum", "log_location": loc1},
-        {"var": "i", "log_location": loc2},
-        {"var": "sum", "log_location": loc2},
+    specs = [
+        BreakpointSpec(location=loc1, inline_expr=["i", "sum"], hit_limit=10, print_call_stack=True),
+        BreakpointSpec(location=loc2, inline_expr=["i", "sum"], hit_limit=10, print_call_stack=True),
     ]
-    res = await _run_dap([str(bin_path)], None, watchpoints, [loc1, loc2])
+    res = await _run_dap([str(bin_path)], None, specs)
 
     # Expect 5 iterations
     assert loc1 in res.breakpoints
@@ -50,4 +48,3 @@ async def test_runtime_feedback_multiple():
     assert "work_multiple" in joined
     assert "main" in joined
     assert b"sum=15\n" == res.stdout
-
