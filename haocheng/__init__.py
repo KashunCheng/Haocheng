@@ -2,20 +2,42 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
-from dap_types import StoppedEvent
-from pydantic import BaseModel
+try:
+    from dap_types import StoppedEvent
+    from pydantic import BaseModel
+    from dap_mcp.factory import DAPClientSingletonFactory
+    from dap_mcp.debugger import (
+        Debugger,
+        LaunchRequestArguments,
+        SetBreakpointsResponse,
+        ErrorResponse,
+    )
 
-from dap_mcp.factory import DAPClientSingletonFactory
-from dap_mcp.debugger import (
-    Debugger,
-    LaunchRequestArguments,
-    SetBreakpointsResponse,
-    ErrorResponse,
-)
+    DAP_AVAILABLE = True
+except ImportError as e:
+    # Handle missing dependencies gracefully
+    print(f"Warning: Missing dependencies for DAP debugging: {e}")
+    DAP_AVAILABLE = False
+
+
+    # Create placeholder classes
+    class BaseModel:
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+
+    StoppedEvent = None
+    DAPClientSingletonFactory = None
+    Debugger = None
+    LaunchRequestArguments = None
+    SetBreakpointsResponse = None
+    ErrorResponse = None
 
 
 class WatchPoint(BaseModel):
@@ -33,28 +55,38 @@ class RuntimeFeedback(BaseModel):
 
 
 # Helper to find a DAP adapter (lldb)
-def _find_lldb_adapter(lldb_path: Path = None) -> Tuple[str, List[str]]:
+def _find_lldb_adapter(lldb_path: Optional[Path] = None) -> Tuple[str, List[str]]:
     """Return (cmd, args) to launch an LLDB DAP adapter.
 
     Tries `lldb-dap` then `lldb-vscode` from PATH.
     """
-    if lldb_path.exists():
-        return str(lldb_path), []
+    # If a path was provided, prefer an adapter next to it
+    if lldb_path:
+        p = Path(lldb_path)
+        # If user already pointed at an adapter, use it
+        if p.name in ("lldb-dap", "lldb-vscode") and p.exists():
+            return str(p), []
+        # Otherwise try siblings in the same directory
+        for name in ("lldb-dap", "lldb-vscode"):
+            cand = p.parent / name
+            if cand.exists():
+                return str(cand), []
+        # Fall through to PATH search
 
-    import shutil
-
+    # Search PATH
     for name in ("lldb-dap", "lldb-vscode"):
         cmd = shutil.which(name)
         if cmd:
             return cmd, []
+
     raise RuntimeError(
-        "Unable to find LLDB DAP adapter in PATH (looked for lldb-dap and lldb-vscode)."
+        "Unable to find LLDB DAP adapter. Install lldb-dap or lldb-vscode and ensure it is on PATH."
     )
 
 
 def _normalize_locations(
         locations: List[str],
-        repo_dir: Path = None
+        repo_dir: Optional[Path] = None
 ) -> Tuple[Dict[str, Tuple[str, int]], List[Tuple[str, int]]]:
     """Return a list of (location, line_no) tuples.
     """
@@ -93,22 +125,27 @@ def _compact_backtrace(frames) -> str:
 
 async def _run_dap(
         cmd: List[str],
-        stdin_bytes: bytes | None,
-        watchpoints_list: List[Dict[str, Any]],
-        monitor_locations: List[str],
-        repo_dir: Path = None,
-        env: Dict[str, str] = None,
-        lldb_path: Path = None,
+        stdin_bytes: Optional[bytes],
+        watchpoint_locations: List[Dict[str, Any]],
+        breakpoint_locations: List[str],
+        repo_dir: Optional[Path] = None,
+        env: Optional[Dict[str, str]] = None,
+        lldb_path: Optional[Path] = None,
 ) -> RuntimeFeedback:
+    if not DAP_AVAILABLE:
+        raise RuntimeError(
+            "DAP debugging is not available. Please install required dependencies (dap_types, pydantic, dap_mcp).")
     # Prepare launch config and env (stdin fallback via file if provided)
     program = str(Path(cmd[0]).resolve())
     args = cmd[1:]
 
     # Stdin strategy: robust fallback via env file
     if env is None:
-        env: Dict[str, str] = dict(os.environ)
+        env_dict: Dict[str, str] = dict(os.environ)
+    else:
+        env_dict = env
 
-    stdin: tempfile.NamedTemporaryFile | None = None
+    stdin: Optional[tempfile._TemporaryFileWrapper] = None
     stdout = tempfile.NamedTemporaryFile(delete=False)
     stderr = tempfile.NamedTemporaryFile(delete=False)
     try:
@@ -125,13 +162,14 @@ async def _run_dap(
                 f"settings set target.input-path {stdin.name}",
             ]
 
+        assert LaunchRequestArguments is not None, "DAP classes not available"
         launch_args = LaunchRequestArguments(
             **({
                 "type": "lldb",
                 "request": "launch",
                 "program": program,
                 "args": args,
-                "env": {k: v for k, v in env.items() if isinstance(v, str)},
+                "env": {k: v for k, v in env_dict.items() if isinstance(v, str)},
                 "stopOnEntry": False,
                 "initCommands": stdio_commands,
             })
@@ -139,11 +177,12 @@ async def _run_dap(
 
         # Prepare adapter
         adapter_cmd, adapter_args = _find_lldb_adapter(lldb_path=lldb_path)
+        assert DAPClientSingletonFactory is not None and Debugger is not None, "DAP classes not available"
         factory = DAPClientSingletonFactory(adapter_cmd, adapter_args)
         dbg = Debugger(factory=factory, launch_arguments=launch_args)
 
         await dbg.initialize()
-        locations = list(set(monitor_locations).union(set(map(lambda d: d["log_location"], watchpoints_list))))
+        locations = list(set(breakpoint_locations).union(set(map(lambda d: d["log_location"], watchpoint_locations))))
         location_to_normalized_location, normalized_locations = _normalize_locations(locations, repo_dir)
         breakpoints_id_to_location: Dict[int, Tuple[str, int]] = {}
         location_to_breakpoint_id: Dict[Tuple[str, int], int] = {}
@@ -151,12 +190,16 @@ async def _run_dap(
         # Set all breakpoints before launch
         for file, line in normalized_locations:
             resp = await dbg.set_breakpoint(Path(file), line)
-            if isinstance(resp, (SetBreakpointsResponse, ErrorResponse)) and isinstance(
-                    resp, ErrorResponse
-            ):
-                raise RuntimeError(
-                    f"Failed to set breakpoint at {file}:{line}: {resp.message}"
-                )
+            # Check for error response if DAP classes are available
+            if DAP_AVAILABLE and SetBreakpointsResponse and ErrorResponse:
+                if isinstance(resp, (SetBreakpointsResponse, ErrorResponse)) and isinstance(
+                        resp, ErrorResponse
+                ):
+                    raise RuntimeError(
+                        f"Failed to set breakpoint at {file}:{line}: {resp.message}"
+                    )
+            if hasattr(resp, 'success') and not resp.success:
+                raise RuntimeError(f"Failed to set breakpoint at {file}:{line}")
             assert resp.success is True
             current_breakpoint = resp.body.breakpoints[-1]
             breakpoints_id_to_location[current_breakpoint.id] = (file, line)
@@ -167,7 +210,7 @@ async def _run_dap(
 
         # Map watchpoints by location for quicker lookup
         wps_by_id: Dict[int, List[str]] = {}
-        for wp in watchpoints_list:
+        for wp in watchpoint_locations:
             w = WatchPoint(**wp)
             loc = location_to_normalized_location[w.log_location]
             breakpoint_id = location_to_breakpoint_id[loc]
@@ -177,10 +220,15 @@ async def _run_dap(
         stopped = await dbg.launch()
         while True:
             # If terminated, dbg.launch/continue returns EventListView
-            from dap_mcp.debugger import StoppedDebuggerView
-
-            if not isinstance(stopped, StoppedDebuggerView):
-                break
+            try:
+                from dap_mcp.debugger import StoppedDebuggerView
+                if not isinstance(stopped, StoppedDebuggerView):
+                    break
+            except ImportError:
+                # Without DAP classes, we can't do proper type checking
+                # Assume stopped is valid if it has required attributes
+                if not hasattr(stopped, 'frames') or not hasattr(stopped, 'events'):
+                    break
 
             # Identify stop site
             frames = stopped.frames
@@ -189,8 +237,21 @@ async def _run_dap(
                 stopped = next_view
                 continue
 
-            breakpoint_event = list(
-                filter(lambda e: isinstance(e, StoppedEvent) and e.body.reason == 'breakpoint', stopped.events.events))
+            # Filter for breakpoint events, handle missing StoppedEvent class
+            if DAP_AVAILABLE and StoppedEvent is not None:
+                # Store StoppedEvent to avoid linter warnings about None
+                stopped_event_cls = StoppedEvent
+
+                def is_breakpoint_event(e):
+                    return isinstance(e, stopped_event_cls) and hasattr(e, 'body') and hasattr(e.body,
+                                                                                               'reason') and e.body.reason == 'breakpoint'
+
+                breakpoint_event = list(filter(is_breakpoint_event, stopped.events.events))
+            else:
+                # Fallback: check by attributes
+                breakpoint_event = list(
+                    filter(lambda e: hasattr(e, 'body') and hasattr(e.body, 'reason') and e.body.reason == 'breakpoint',
+                           stopped.events.events))
             if not breakpoint_event:
                 next_view = await dbg.continue_execution()
                 stopped = next_view
@@ -225,7 +286,7 @@ async def _run_dap(
             stopped = next_view
 
         # Ensure keys exist even if never hit
-        for loc in monitor_locations:
+        for loc in breakpoint_locations:
             result.breakpoints.setdefault(loc, [])
             result.watchpoints.setdefault(loc, [])
 
@@ -249,22 +310,158 @@ async def _run_dap(
             pass
 
 
-def get_runtime_feedback(
-        cmd: List[str],
-        stdin: bytes | None,
-        watchpoints_list: List[Dict[str, Any]],
-        monitor_locations: List[str],
-        repo_dir: Path = None,
-        env: Dict[str, str] = None,
-        lldb_path: Path = None,
-) -> RuntimeFeedback:
-    """
-    Launch the process under LLDB via DAP and collect runtime feedback.
+class RuntimeDebugger:
+    """Runtime debugger class for collecting runtime feedback via LLDB DAP."""
 
-    - cmd: argv for the compiled C program (absolute or cwd-relative path first).
-    - stdin: optional bytes to feed to program (handled via env file fallback).
-    - watchpoints_list: list of {"var": <expr>, "log_location": "file:line"}.
-    - monitor_locations: list of "file:line" at which to set breakpoints.
-    """
+    def __init__(self, config=None):
+        """Initialize the RuntimeDebugger with configuration."""
+        self.lldb_path: Optional[Path] = None
+        self.env: Optional[Dict[str, str]] = None
+        self.repo_dir: Optional[Path] = None
 
-    return asyncio.run(_run_dap(cmd, stdin, watchpoints_list, monitor_locations, repo_dir, env, lldb_path))
+        if config:
+            self._load_from_config(config)
+        else:
+            self._load_default_config()
+
+    def _load_from_config(self, config):
+        """Load configuration from config object."""
+        # Load lldb_path
+        if config.lldb_path:
+            path = Path(config.lldb_path)
+            if path.exists():
+                self.lldb_path = path
+            else:
+                print(f"Warning: lldb_path {config.lldb_path} does not exist, using auto-detection")
+                self.lldb_path = self._auto_find_lldb_path()
+        else:
+            # No lldb_path configured, use auto-detection
+            self.lldb_path = self._auto_find_lldb_path()
+
+        # Load env
+        if config.debugger_env:
+            self.env = config.debugger_env.copy()
+
+        # Auto-update PATH with lldb directory if lldb_path was auto-detected
+        self._update_path_with_lldb()
+
+        # Load repo_dir
+        if config.source_code_dir:
+            path = Path(config.source_code_dir)
+            if path.exists() and path.is_dir():
+                self.repo_dir = path
+            else:
+                print(f"Warning: repo_dir {config.source_code_dir} does not exist or is not a directory")
+                self.repo_dir = None
+
+    def _auto_find_lldb_path(self) -> Optional[Path]:
+        """Auto-detect lldb path from /usr/bin/lldb*, preferring highest version."""
+        import glob
+        import re
+
+        # Find all lldb binaries in /usr/bin/
+        lldb_paths = glob.glob('/usr/bin/lldb*')
+        if not lldb_paths:
+            return None
+
+        # Filter to main lldb binaries (exclude lldb-argdumper, lldb-server, etc.)
+        main_lldb_paths = []
+        for path in lldb_paths:
+            filename = Path(path).name
+            # Match lldb or lldb-<version>
+            if re.match(r'^lldb(-\d+)?$', filename):
+                main_lldb_paths.append(path)
+
+        if not main_lldb_paths:
+            return None
+
+        # Sort by version number (highest first)
+        def version_key(path):
+            filename = Path(path).name
+            # Extract version number, default to 0 for plain 'lldb'
+            match = re.search(r'-(\d+)$', filename)
+            return int(match.group(1)) if match else 0
+
+        # Sort in descending order (highest version first)
+        main_lldb_paths.sort(key=version_key, reverse=True)
+
+        # Return the highest version that exists and is executable
+        for path in main_lldb_paths:
+            lldb_path = Path(path)
+            if lldb_path.exists() and lldb_path.is_file():
+                # Resolve symlinks to get the actual executable
+                try:
+                    resolved_path = lldb_path.resolve()
+                    if resolved_path.exists() and resolved_path.is_file():
+                        print(f"Auto-detected lldb path: {resolved_path}")
+                        return resolved_path
+                except Exception:
+                    continue
+
+        return None
+
+    def _update_path_with_lldb(self):
+        """Update PATH environment variable to include lldb directory."""
+        if not self.lldb_path:
+            return
+
+        # Get the directory containing the lldb executable
+        lldb_dir = str(self.lldb_path.parent)
+
+        # Initialize env if it's None
+        if self.env is None:
+            self.env = os.environ.copy()
+
+        # Get current PATH from env
+        current_path = self.env.get('PATH', '')
+
+        # Check if lldb_dir is already in PATH
+        path_dirs = current_path.split(os.pathsep) if current_path else []
+        if lldb_dir not in path_dirs:
+            # Prepend lldb_dir to PATH (like export PATH=/usr/lib/llvm-20/bin:$PATH)
+            new_path = lldb_dir + (os.pathsep + current_path if current_path else '')
+            self.env['PATH'] = new_path
+
+    def _load_default_config(self):
+        """Load default configuration when no config is provided."""
+        self.lldb_path = self._auto_find_lldb_path()  # Auto-detect lldb path
+        self.env = None  # Will use os.environ
+        self.repo_dir = None  # Will be determined at runtime
+
+        # Auto-update PATH with lldb directory
+        self._update_path_with_lldb()
+
+    async def _run_dap_async(
+            self,
+            cmd: List[str],
+            stdin_bytes: Optional[bytes],
+            watchpoint_locations: List[Dict[str, Any]],
+            breakpoint_locations: List[str],
+    ) -> RuntimeFeedback:
+        """Async version of runtime debugging."""
+        return await _run_dap(
+            cmd,
+            stdin_bytes,
+            watchpoint_locations,
+            breakpoint_locations,
+            self.repo_dir,
+            self.env,
+            self.lldb_path
+        )
+
+    def get_runtime_feedback(
+            self,
+            cmd: List[str],
+            stdin: Optional[bytes],
+            watchpoint_locations: List[Dict[str, Any]],
+            breakpoint_locations: List[str],
+    ) -> RuntimeFeedback:
+        """
+        Launch the process under LLDB via DAP and collect runtime feedback.
+
+        - cmd: argv for the compiled C program (absolute or cwd-relative path first).
+        - stdin: optional bytes to feed to program (handled via env file fallback).
+        - watchpoint_locations: list of {"var": <expr>, "log_location": "file:line"}.
+        - breakpoint_locations: list of "file:line" at which to set breakpoints.
+        """
+        return asyncio.run(self._run_dap_async(cmd, stdin, watchpoint_locations, breakpoint_locations))

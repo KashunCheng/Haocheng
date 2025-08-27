@@ -1,12 +1,13 @@
 import pytest
 
-from haocheng import get_runtime_feedback
+from haocheng import _run_dap
 from tests import _which_lldb_adapter, _can_spawn_adapter, ROOT, _compile_fixture, _parse_int
 
 
 @pytest.mark.skipif(not _which_lldb_adapter(), reason="lldb-dap/lldb-vscode not found in PATH")
 @pytest.mark.skipif(not _can_spawn_adapter(), reason="Sandbox cannot execute lldb adapter")
-def test_runtime_feedback_multiple():
+@pytest.mark.asyncio
+async def test_runtime_feedback_multiple():
     src = ROOT / "fixtures" / "loop_multiple.c"
     bin_path = _compile_fixture(src)
 
@@ -18,7 +19,7 @@ def test_runtime_feedback_multiple():
         {"var": "i", "log_location": loc2},
         {"var": "sum", "log_location": loc2},
     ]
-    res = get_runtime_feedback([str(bin_path)], None, watchpoints, [loc1, loc2])
+    res = await _run_dap([str(bin_path)], None, watchpoints, [loc1, loc2])
 
     # Expect 5 iterations
     assert loc1 in res.breakpoints
