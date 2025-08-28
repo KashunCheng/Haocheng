@@ -17,19 +17,20 @@ async def test_runtime_feedback_stdin():
     ]
     res = await _run_dap([str(bin_path)], b"4\n", specs)
 
-    # Expect 4 iterations (1..4)
-    assert loc in res.breakpoints
-    assert loc in res.watchpoints
-    assert len(res.breakpoints[loc]) == 4
-    assert len(res.watchpoints[loc]) == 8  # two vars per stop
+    # Find the report by file and line
+    reports = list(res.reports.values())
+    bp = next(r for r in reports if r.file_path == str(src) and r.line == 13)
 
-    i_vals = [_parse_int(e["value"]) for e in res.watchpoints[loc] if e["var"] == "i"]
-    a_vals = [_parse_int(e["value"]) for e in res.watchpoints[loc] if e["var"] == "acc"]
+    # Expect 4 iterations (1..4)
+    assert bp.hit_times == 4
+    assert len(bp.hits_info) == 4
+
+    i_vals = [_parse_int(hit.inline_expr[0].value) for hit in bp.hits_info]
+    a_vals = [_parse_int(hit.inline_expr[1].value) for hit in bp.hits_info]
     assert i_vals == [1, 2, 3, 4]
     assert a_vals == [1, 1, 2, 6]
 
-    assert all(isinstance(bt, str) and bt for bt in res.breakpoints[loc])
-    joined = "\n".join(res.breakpoints[loc])
+    joined = "\n".join(h.callstack for h in bp.hits_info)
     assert "work_stdin" in joined
     assert "main" in joined
     assert b"acc=24\n" == res.stdout

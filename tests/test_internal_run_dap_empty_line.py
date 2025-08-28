@@ -18,21 +18,22 @@ async def test_runtime_feedback_empty_line():
     ]
     res = await _run_dap([str(bin_path)], None, specs)
 
+    # Find the actual report at the real executable line
+    reports = list(res.reports.values())
+    bp = next(r for r in reports if r.file_path == str(src) and r.line == 7)
+
     # Expect 5 iterations
-    assert loc_real in res.breakpoints
-    assert loc_real in res.watchpoints
-    assert len(res.breakpoints[loc_real]) == 5
-    assert len(res.watchpoints[loc_real]) == 10  # two vars per stop
+    assert bp.hit_times == 5
+    assert len(bp.hits_info) == 5
 
     # Extract values ordered by hits
-    i_vals = [_parse_int(e["value"]) for e in res.watchpoints[loc_real] if e["var"] == "i"]
-    s_vals = [_parse_int(e["value"]) for e in res.watchpoints[loc_real] if e["var"] == "sum"]
+    i_vals = [_parse_int(hit.inline_expr[0].value) for hit in bp.hits_info]
+    s_vals = [_parse_int(hit.inline_expr[1].value) for hit in bp.hits_info]
     assert i_vals == [0, 1, 2, 3, 4]
     assert s_vals == [0, 0, 1, 3, 6]
 
     # Backtrace strings non-empty and show function names
-    assert all(isinstance(bt, str) and bt for bt in res.breakpoints[loc_real])
-    joined = "\n".join(res.breakpoints[loc_real])
+    joined = "\n".join(h.callstack for h in bp.hits_info)
     assert "work_basic" in joined
     assert "main" in joined
     assert b"sum=10\n" == res.stdout

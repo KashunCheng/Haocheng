@@ -19,32 +19,30 @@ async def test_runtime_feedback_multiple():
     ]
     res = await _run_dap([str(bin_path)], None, specs)
 
-    # Expect 5 iterations
-    assert loc1 in res.breakpoints
-    assert loc2 in res.breakpoints
-    assert loc1 in res.watchpoints
-    assert loc2 in res.watchpoints
-    assert len(res.breakpoints[loc1]) == 5
-    assert len(res.watchpoints[loc1]) == 10  # two vars per stop
+    reports = list(res.reports.values())
+    bp1 = next(r for r in reports if r.file_path == str(src) and r.line == 6)
+    bp2 = next(r for r in reports if r.file_path == str(src) and r.line == 7)
 
-    # Extract values ordered by hits
-    i_vals = [_parse_int(e["value"]) for e in res.watchpoints[loc1] if e["var"] == "i"]
-    s_vals = [_parse_int(e["value"]) for e in res.watchpoints[loc1] if e["var"] == "sum"]
+    # Expect 5 iterations on both breakpoints
+    assert bp1.hit_times == 5
+    assert bp2.hit_times == 5
+    assert len(bp1.hits_info) == 5
+    assert len(bp2.hits_info) == 5
+
+    # Extract values ordered by hits for loc1
+    i_vals = [_parse_int(hit.inline_expr[0].value) for hit in bp1.hits_info]
+    s_vals = [_parse_int(hit.inline_expr[1].value) for hit in bp1.hits_info]
     assert i_vals == [0, 1, 2, 3, 4]
     assert s_vals == [0, 1, 3, 6, 10]
 
-    assert len(res.breakpoints[loc2]) == 5
-    assert len(res.watchpoints[loc2]) == 10  # two vars per stop
-
-    # Extract values ordered by hits
-    i_vals = [_parse_int(e["value"]) for e in res.watchpoints[loc2] if e["var"] == "i"]
-    s_vals = [_parse_int(e["value"]) for e in res.watchpoints[loc2] if e["var"] == "sum"]
+    # Extract values ordered by hits for loc2
+    i_vals = [_parse_int(hit.inline_expr[0].value) for hit in bp2.hits_info]
+    s_vals = [_parse_int(hit.inline_expr[1].value) for hit in bp2.hits_info]
     assert i_vals == [0, 1, 2, 3, 4]
     assert s_vals == [0, 2, 5, 9, 14]
 
     # Backtrace strings non-empty and show function names
-    assert all(isinstance(bt, str) and bt for bt in res.breakpoints[loc1])
-    joined = "\n".join(res.breakpoints[loc1])
+    joined = "\n".join(h.callstack for h in bp1.hits_info)
     assert "work_multiple" in joined
     assert "main" in joined
     assert b"sum=15\n" == res.stdout
