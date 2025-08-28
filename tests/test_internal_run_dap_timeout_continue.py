@@ -25,5 +25,7 @@ async def test_continue_timeout():
     assert bp.line == 5
     assert bp.hit_times == 1
     assert len(bp.hits_info) == 1
-    # Inline expr x should be 1 at the hit
+    # Inline expr x should be 0 at the hit (executed before increment)
     assert _parse_int(bp.hits_info[0].inline_expr[0].value) == 0
+    # Timeout should mark exit_code as None
+    assert res.exit_code is None

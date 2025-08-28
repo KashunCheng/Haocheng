@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 try:
     import asyncio
     import time
@@ -9,15 +11,17 @@ try:
     from pathlib import Path
     from typing import Any, Dict, List, Tuple, Optional
 
-    from dap_types import StoppedEvent, StackFrame
+    from dap_types import StoppedEvent, StackFrame, ExitedEvent
     from pydantic import BaseModel, Field
     from dap_mcp.factory import DAPClientSingletonFactory
     from dap_mcp.debugger import (
         Debugger,
         LaunchRequestArguments,
         SetBreakpointsResponse,
-        ErrorResponse, StoppedDebuggerView,
-)
+        ErrorResponse,
+        StoppedDebuggerView,
+        EventListView,
+    )
 
 
     class WatchPoint(BaseModel):
@@ -29,6 +33,9 @@ try:
         stdout: bytes
         stderr: bytes
         reports: dict[int, BreakpointReport]
+        timeout: bool
+        exit_code: Optional[int]
+        signal: Optional[str]
 
 
     # New Pydantic models for the updated API schema
@@ -80,8 +87,8 @@ try:
         """Output schema for get_runtime_feedback (new format)."""
 
         stderr: str
-        exit_code: int
-        signal: int
+        exit_code: Optional[int]
+        signal: Optional[str]
         breakpoints: list[BreakpointReport]
 
 
@@ -143,7 +150,9 @@ try:
     def _compact_backtrace(frames: list[StackFrame]) -> str:
         backtrace = []
         for fid, frame in enumerate(frames):
-            backtrace.append(f"{'*' if fid == 0 else ' '} #{fid}: {_format_single_frame(frame)}")
+            backtrace.append(
+                f"{'*' if fid == 0 else ' '} #{fid}: {_format_single_frame(frame)}"
+            )
         return "\n".join(backtrace)
 
 
@@ -157,7 +166,9 @@ try:
             timeout_sec: Optional[float] = None,
     ) -> RuntimeFeedback:
         # Aggregate results
-        result = RuntimeFeedback(stdout=b"", stderr=b"", reports={})
+        result = RuntimeFeedback(
+            stdout=b"", stderr=b"", reports={}, timeout=False, exit_code=None, signal=None
+        )
 
         # Prepare launch config and env (stdin fallback via file if provided)
         program = str(Path(cmd[0]).resolve())
@@ -243,6 +254,7 @@ try:
                 elapsed = time.monotonic() - start_ts
                 remaining = timeout_sec - elapsed
                 if remaining <= 0:
+                    result.timeout = True
                     raise asyncio.TimeoutError()
                 return await asyncio.wait_for(awaitable, timeout=remaining)
 
@@ -265,26 +277,25 @@ try:
                     continue
 
                 # Store StoppedEvent to avoid linter warnings about None
-                stopped_event_cls = StoppedEvent
-
-                def is_breakpoint_event(e):
-                    return (
-                            isinstance(e, stopped_event_cls)
-                            and hasattr(e, "body")
-                            and hasattr(e.body, "reason")
-                            and e.body.reason == "breakpoint"
-                    )
-
                 breakpoint_event = list(
-                    filter(is_breakpoint_event, stopped.events.events)
+                    filter(lambda e: isinstance(e, StoppedEvent) and e.body.reason == 'breakpoint', stopped.events.events)
                 )
                 if not breakpoint_event:
-                    try:
-                        next_view = await _with_timeout(dbg.continue_execution())
-                    except asyncio.TimeoutError:
-                        break
-                    stopped = next_view
-                    continue
+                    stopped_event: List[StoppedEvent] = list(
+                        filter(lambda e: isinstance(e, StoppedEvent), stopped.events.events)
+                    )
+                    assert len(stopped_event) == 1
+                    reason = stopped_event[0].body.reason
+                    if reason != 'exception':
+                        logging.warning(f"Unhandled stopping reason {reason}")
+                        try:
+                            next_view = await _with_timeout(dbg.continue_execution())
+                        except asyncio.TimeoutError:
+                            break
+                        stopped = next_view
+                        continue
+                    result.signal = stopped_event[0].body.description
+                    break
                 assert len(breakpoint_event) == 1
                 breakpoint_ids = breakpoint_event[0].body.hitBreakpointIds
 
@@ -301,7 +312,9 @@ try:
                     report.function_name = function_name
                     report.hit_times += 1
                     if report.hit_times >= spec.hit_limit:
-                        response = await dbg.remove_breakpoint(Path(spec.file_path), spec.line_no)
+                        response = await dbg.remove_breakpoint(
+                            Path(spec.file_path), spec.line_no
+                        )
                         assert isinstance(response, SetBreakpointsResponse)
                         assert response.success is True
                     report.file_path = top.source.path
@@ -333,6 +346,14 @@ try:
                 except asyncio.TimeoutError:
                     break
                 stopped = next_view
+
+            if isinstance(stopped, EventListView):
+                exited_events = list(
+                    filter(lambda e: isinstance(e, ExitedEvent), stopped.events)
+                )
+                if exited_events:
+                    exited_event: ExitedEvent = exited_events[0]
+                    result.exit_code = exited_event.body.exitCode
 
             # Graceful shutdown
             await dbg.terminate()
@@ -504,9 +525,7 @@ try:
                 self,
                 cmd: List[str],
                 stdin: Optional[bytes] = None,
-                timeout_sec: Optional[
-                    int
-                ] = None,  # currently unused; reserved for future timeouts
+                timeout_sec: Optional[int] = None,
                 breakpoints: Optional[List[Dict[str, Any]]] = None,
         ) -> Dict[str, Any]:
             """
@@ -524,25 +543,25 @@ try:
                 breakpoints = []
 
             # Parse breakpoint specs (dicts -> Pydantic models)
-            specs: List[BreakpointSpec] = []
-            hit_limit_by_loc: Dict[str, int] = {}
-            stack_flag_by_loc: Dict[str, bool] = {}
-            for item in breakpoints:
-                bp = BreakpointSpec(**item)
-                specs.append(bp)
-                hit_limit_by_loc[bp.location] = (
-                    int(bp.hit_limit) if bp.hit_limit is not None else 10
-                )
-                stack_flag_by_loc[bp.location] = bool(bp.print_call_stack)
+            specs: List[BreakpointSpec] = list(
+                map(lambda bs: BreakpointSpec(**bs), breakpoints)
+            )
 
             # Execute via DAP runner to collect raw data
-            raw = asyncio.run(self._run_dap_async(cmd, stdin, specs, timeout_sec=float(timeout_sec) if timeout_sec else None))
+            raw = asyncio.run(
+                self._run_dap_async(
+                    cmd,
+                    stdin,
+                    specs,
+                    timeout_sec=float(timeout_sec) if timeout_sec else None,
+                )
+            )
 
             # Prepare final output; exit_code/signal are currently 0 until extended
             out = RuntimeFeedbackV2(
                 stderr=(raw.stderr.decode(errors="replace")),
-                exit_code=0,
-                signal=0,
+                exit_code=raw.exit_code,
+                signal=raw.signal,
                 breakpoints=list(raw.reports.values()),
             )
             return out.model_dump()

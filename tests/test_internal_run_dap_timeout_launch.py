@@ -26,3 +26,5 @@ async def test_launch_timeout():
     assert bp.line == 6
     assert bp.hit_times == 0
     assert len(bp.hits_info) == 0
+    # Timeout should mark exit_code as None
+    assert res.exit_code is None
