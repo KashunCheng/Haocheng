@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import logging
-
 try:
+    # Standard libs
     import asyncio
     import time
     import os
@@ -11,6 +10,7 @@ try:
     from pathlib import Path
     from typing import Any, Dict, List, Tuple, Optional
 
+    # DAP types and client
     from dap_types import StoppedEvent, StackFrame, ExitedEvent
     from pydantic import BaseModel, Field
     from dap_mcp.factory import DAPClientSingletonFactory
@@ -23,12 +23,6 @@ try:
         EventListView,
     )
 
-
-    class WatchPoint(BaseModel):
-        var: str
-        log_location: str  # "file.c:LINE" (normalized relative to repo root)
-
-
     class RuntimeFeedback(BaseModel):
         stdout: bytes
         stderr: bytes
@@ -36,7 +30,6 @@ try:
         timeout: bool
         exit_code: Optional[int]
         signal: Optional[str]
-
 
     # New Pydantic models for the updated API schema
     class BreakpointSpec(BaseModel):
@@ -63,16 +56,13 @@ try:
             _, ln = self.location.rsplit(":", 1)
             return int(ln)
 
-
     class InlineExprValue(BaseModel):
         name: str
         value: str
 
-
     class BreakpointHitInfo(BaseModel):
         callstack: str
         inline_expr: list[InlineExprValue]
-
 
     class BreakpointReport(BaseModel):
         id: int
@@ -82,7 +72,6 @@ try:
         hit_times: int
         hits_info: list[BreakpointHitInfo]
 
-
     class RuntimeFeedbackV2(BaseModel):
         """Output schema for get_runtime_feedback (new format)."""
 
@@ -91,83 +80,75 @@ try:
         signal: Optional[str]
         breakpoints: list[BreakpointReport]
 
-
-    # Helper to find a DAP adapter (lldb)
+    # Locate LLDB's DAP adapter. Prefer an explicit adapter path if provided,
+    # otherwise try `lldb-dap` then `lldb-vscode` on PATH.
     def _find_lldb_adapter(lldb_path: Optional[Path] = None) -> Tuple[str, List[str]]:
-        """Return (cmd, args) to launch an LLDB DAP adapter.
-
-        Tries `lldb-dap` then `lldb-vscode` from PATH.
-        """
-        # If a path was provided, prefer an adapter next to it
         if lldb_path:
             p = Path(lldb_path)
-            # If user already pointed at an adapter, use it
             if p.name in ("lldb-dap", "lldb-vscode") and p.exists():
                 return str(p), []
-            # Otherwise try siblings in the same directory
+            # Try siblings next to the provided path
             for name in ("lldb-dap", "lldb-vscode"):
                 cand = p.parent / name
                 if cand.exists():
                     return str(cand), []
-            # Fall through to PATH search
-
-        # Search PATH
         for name in ("lldb-dap", "lldb-vscode"):
             cmd = shutil.which(name)
             if cmd:
                 return cmd, []
-
-        raise RuntimeError(
-            "Unable to find LLDB DAP adapter. Install lldb-dap or lldb-vscode and ensure it is on PATH."
-        )
-
+        raise RuntimeError("LLDB DAP adapter not found (lldb-dap or lldb-vscode)")
 
     def _normalize_locations(
-            breakpoints: List[BreakpointSpec], repo_dir: Optional[Path] = None
+        breakpoints: List[BreakpointSpec], repo_dir: Optional[Path] = None
     ) -> None:
-        """Normalize BreakpointSpec locations to absolute file paths in place."""
+        """Normalize BreakpointSpec locations to absolute file paths in-place.
+
+        Tests pass absolute file paths already; this also supports repo-relative paths
+        when a `repo_dir` is provided.
+        """
         for bp in breakpoints:
-            loc = bp.location
-            file_str, line_part = loc.rsplit(":", 1)
+            file_str, line_part = bp.location.rsplit(":", 1)
             file_path = Path(file_str)
-            if file_path.is_absolute():
-                if file_path.exists():
-                    bp.location = f"{file_path}:{line_part}"
-                    continue
+            if file_path.is_absolute() and file_path.exists():
+                bp.location = f"{file_path}:{line_part}"
+                continue
             if repo_dir is not None:
-                guess = repo_dir / file_path
+                guess = (repo_dir / file_path).resolve()
                 if guess.exists():
                     bp.location = f"{guess}:{line_part}"
                     continue
 
-
     def _format_single_frame(frame: StackFrame) -> str:
-        if frame.source:
-            return f"{frame.name} at {frame.source.name}:{frame.line}"
-        return f"{frame.name}"
-
+        return (
+            f"{frame.name} at {frame.source.name}:{frame.line}"
+            if frame.source
+            else frame.name
+        )
 
     def _compact_backtrace(frames: list[StackFrame]) -> str:
-        backtrace = []
-        for fid, frame in enumerate(frames):
-            backtrace.append(
-                f"{'*' if fid == 0 else ' '} #{fid}: {_format_single_frame(frame)}"
-            )
-        return "\n".join(backtrace)
-
+        """Return a compact, multi-line callstack string for the stopped thread."""
+        return "\n".join(
+            f"{'*' if i == 0 else ' '} #{i}: {_format_single_frame(f)}"
+            for i, f in enumerate(frames)
+        )
 
     async def _run_dap(
-            cmd: List[str],
-            stdin_bytes: Optional[bytes],
-            breakpoints: List[BreakpointSpec],
-            repo_dir: Optional[Path] = None,
-            env: Optional[Dict[str, str]] = None,
-            lldb_path: Optional[Path] = None,
-            timeout_sec: Optional[float] = None,
+        cmd: List[str],
+        stdin_bytes: Optional[bytes],
+        breakpoints: List[BreakpointSpec],
+        repo_dir: Optional[Path] = None,
+        env: Optional[Dict[str, str]] = None,
+        lldb_path: Optional[Path] = None,
+        timeout_sec: Optional[float] = None,
     ) -> RuntimeFeedback:
         # Aggregate results
         result = RuntimeFeedback(
-            stdout=b"", stderr=b"", reports={}, timeout=False, exit_code=None, signal=None
+            stdout=b"",
+            stderr=b"",
+            reports={},
+            timeout=False,
+            exit_code=None,
+            signal=None,
         )
 
         # Prepare launch config and env (stdin fallback via file if provided)
@@ -213,7 +194,7 @@ try:
                 )
             )
 
-            # Prepare adapter
+            # Prepare adapter and debugger
             adapter_cmd, adapter_args = _find_lldb_adapter(lldb_path=lldb_path)
             factory = DAPClientSingletonFactory(adapter_cmd, adapter_args)
             dbg = Debugger(factory=factory, launch_arguments=launch_args)
@@ -226,7 +207,7 @@ try:
             for spec in breakpoints:
                 resp = await dbg.set_breakpoint(Path(spec.file_path), spec.line_no)
                 if isinstance(
-                        resp, (SetBreakpointsResponse, ErrorResponse)
+                    resp, (SetBreakpointsResponse, ErrorResponse)
                 ) and isinstance(resp, ErrorResponse):
                     raise RuntimeError(
                         f"Failed to set breakpoint at {spec.location}: {resp.message}"
@@ -264,7 +245,6 @@ try:
                 stopped = None
             while True:
                 # If terminated, dbg.launch/continue returns EventListView
-                # Identify stop site
                 if not isinstance(stopped, StoppedDebuggerView):
                     break
                 frames = stopped.frames
@@ -276,18 +256,25 @@ try:
                     stopped = next_view
                     continue
 
-                # Store StoppedEvent to avoid linter warnings about None
+                # Identify a breakpoint stop
                 breakpoint_event = list(
-                    filter(lambda e: isinstance(e, StoppedEvent) and e.body.reason == 'breakpoint', stopped.events.events)
+                    filter(
+                        lambda e: isinstance(e, StoppedEvent)
+                        and e.body.reason == "breakpoint",
+                        stopped.events.events,
+                    )
                 )
                 if not breakpoint_event:
+                    # Handle non-breakpoint stops (e.g., exception/signals)
                     stopped_event: List[StoppedEvent] = list(
-                        filter(lambda e: isinstance(e, StoppedEvent), stopped.events.events)
+                        filter(
+                            lambda e: isinstance(e, StoppedEvent), stopped.events.events
+                        )
                     )
                     assert len(stopped_event) == 1
                     reason = stopped_event[0].body.reason
-                    if reason != 'exception':
-                        logging.warning(f"Unhandled stopping reason {reason}")
+                    if reason != "exception":
+                        print(f"Warning: Unhandled stopping reason {reason}")
                         try:
                             next_view = await _with_timeout(dbg.continue_execution())
                         except asyncio.TimeoutError:
@@ -340,7 +327,7 @@ try:
                         )
                     report.hits_info.append(hit_info)
 
-                # Continue
+                # Continue execution
                 try:
                     next_view = await _with_timeout(dbg.continue_execution())
                 except asyncio.TimeoutError:
@@ -355,7 +342,7 @@ try:
                     exited_event: ExitedEvent = exited_events[0]
                     result.exit_code = exited_event.body.exitCode
 
-            # Graceful shutdown
+            # Graceful shutdown and stdio collection
             await dbg.terminate()
             with open(stdout.name, "rb") as f:
                 result.stdout = f.read()
@@ -373,7 +360,6 @@ try:
                 os.unlink(stderr.name)
             except Exception:
                 pass
-
 
     class RuntimeDebugger:
         """Runtime debugger class for collecting runtime feedback via LLDB DAP."""
@@ -504,13 +490,12 @@ try:
             self._update_path_with_lldb()
 
         async def _run_dap_async(
-                self,
-                cmd: List[str],
-                stdin_bytes: Optional[bytes],
-                breakpoints: List[BreakpointSpec],
-                timeout_sec: Optional[float] = None,
+            self,
+            cmd: List[str],
+            stdin_bytes: Optional[bytes],
+            breakpoints: List[BreakpointSpec],
+            timeout_sec: Optional[float] = None,
         ) -> RuntimeFeedback:
-            """Async version of runtime debugging."""
             return await _run_dap(
                 cmd,
                 stdin_bytes,
@@ -522,32 +507,22 @@ try:
             )
 
         def get_runtime_feedback(
-                self,
-                cmd: List[str],
-                stdin: Optional[bytes] = None,
-                timeout_sec: Optional[int] = None,
-                breakpoints: Optional[List[Dict[str, Any]]] = None,
+            self,
+            cmd: List[str],
+            stdin: Optional[bytes] = None,
+            timeout_sec: Optional[int] = None,
+            breakpoints: Optional[List[Dict[str, Any]]] = None,
         ) -> Dict[str, Any]:
+            """Run a program under LLDB DAP and return a summarized report.
+
+            - cmd: program argv (first item is the binary)
+            - stdin: optional bytes to feed into the program
+            - timeout_sec: optional timeout applied across launch/continues
+            - breakpoints: list of dicts parsed as BreakpointSpec
             """
-            Run program under LLDB DAP and return feedback in the new schema.
-
-            Args:
-            - cmd: program argv (first item is path to binary)
-            - stdin: optional bytes to feed to the program
-            - timeout_sec: optional timeout (not enforced yet)
-            - breakpoints: list of breakpoint specs matching BreakpointSpec
-
-            Returns a dict matching RuntimeFeedbackV2 schema.
-            """
-            if not breakpoints:
-                breakpoints = []
-
-            # Parse breakpoint specs (dicts -> Pydantic models)
-            specs: List[BreakpointSpec] = list(
-                map(lambda bs: BreakpointSpec(**bs), breakpoints)
-            )
-
-            # Execute via DAP runner to collect raw data
+            specs: List[BreakpointSpec] = [
+                BreakpointSpec(**bs) for bs in (breakpoints or [])
+            ]
             raw = asyncio.run(
                 self._run_dap_async(
                     cmd,
@@ -556,10 +531,8 @@ try:
                     timeout_sec=float(timeout_sec) if timeout_sec else None,
                 )
             )
-
-            # Prepare final output; exit_code/signal are currently 0 until extended
             out = RuntimeFeedbackV2(
-                stderr=(raw.stderr.decode(errors="replace")),
+                stderr=raw.stderr.decode(errors="replace"),
                 exit_code=raw.exit_code,
                 signal=raw.signal,
                 breakpoints=list(raw.reports.values()),
