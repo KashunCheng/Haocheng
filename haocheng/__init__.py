@@ -2,6 +2,7 @@ from __future__ import annotations
 
 try:
     import asyncio
+    import time
     import os
     import shutil
     import tempfile
@@ -153,6 +154,7 @@ try:
             repo_dir: Optional[Path] = None,
             env: Optional[Dict[str, str]] = None,
             lldb_path: Optional[Path] = None,
+            timeout_sec: Optional[float] = None,
     ) -> RuntimeFeedback:
         # Aggregate results
         result = RuntimeFeedback(stdout=b"", stderr=b"", reports={})
@@ -232,8 +234,22 @@ try:
                     hits_info=[],
                 )
 
-            # Launch and event loop
-            stopped = await dbg.launch()
+            # Launch and event loop with timeout tracking
+            start_ts = time.monotonic()
+
+            async def _with_timeout(awaitable):
+                if timeout_sec is None:
+                    return await awaitable
+                elapsed = time.monotonic() - start_ts
+                remaining = timeout_sec - elapsed
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                return await asyncio.wait_for(awaitable, timeout=remaining)
+
+            try:
+                stopped = await _with_timeout(dbg.launch())
+            except asyncio.TimeoutError:
+                stopped = None
             while True:
                 # If terminated, dbg.launch/continue returns EventListView
                 # Identify stop site
@@ -241,7 +257,10 @@ try:
                     break
                 frames = stopped.frames
                 if not frames:
-                    next_view = await dbg.continue_execution()
+                    try:
+                        next_view = await _with_timeout(dbg.continue_execution())
+                    except asyncio.TimeoutError:
+                        break
                     stopped = next_view
                     continue
 
@@ -260,7 +279,10 @@ try:
                     filter(is_breakpoint_event, stopped.events.events)
                 )
                 if not breakpoint_event:
-                    next_view = await dbg.continue_execution()
+                    try:
+                        next_view = await _with_timeout(dbg.continue_execution())
+                    except asyncio.TimeoutError:
+                        break
                     stopped = next_view
                     continue
                 assert len(breakpoint_event) == 1
@@ -306,7 +328,10 @@ try:
                     report.hits_info.append(hit_info)
 
                 # Continue
-                next_view = await dbg.continue_execution()
+                try:
+                    next_view = await _with_timeout(dbg.continue_execution())
+                except asyncio.TimeoutError:
+                    break
                 stopped = next_view
 
             # Graceful shutdown
@@ -462,10 +487,17 @@ try:
                 cmd: List[str],
                 stdin_bytes: Optional[bytes],
                 breakpoints: List[BreakpointSpec],
+                timeout_sec: Optional[float] = None,
         ) -> RuntimeFeedback:
             """Async version of runtime debugging."""
             return await _run_dap(
-                cmd, stdin_bytes, breakpoints, self.repo_dir, self.env, self.lldb_path
+                cmd,
+                stdin_bytes,
+                breakpoints,
+                self.repo_dir,
+                self.env,
+                self.lldb_path,
+                timeout_sec,
             )
 
         def get_runtime_feedback(
@@ -504,7 +536,7 @@ try:
                 stack_flag_by_loc[bp.location] = bool(bp.print_call_stack)
 
             # Execute via DAP runner to collect raw data
-            raw = asyncio.run(self._run_dap_async(cmd, stdin, specs))
+            raw = asyncio.run(self._run_dap_async(cmd, stdin, specs, timeout_sec=float(timeout_sec) if timeout_sec else None))
 
             # Prepare final output; exit_code/signal are currently 0 until extended
             out = RuntimeFeedbackV2(
