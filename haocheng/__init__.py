@@ -79,6 +79,7 @@ try:
         exit_code: Optional[int]
         signal: Optional[str]
         breakpoints: list[BreakpointReport]
+        has_timeout: bool
 
     # Locate LLDB's DAP adapter. Prefer an explicit adapter path if provided,
     # otherwise try `lldb-dap` then `lldb-vscode` on PATH.
@@ -235,13 +236,13 @@ try:
                 elapsed = time.monotonic() - start_ts
                 remaining = timeout_sec - elapsed
                 if remaining <= 0:
-                    result.timeout = True
                     raise asyncio.TimeoutError()
                 return await asyncio.wait_for(awaitable, timeout=remaining)
 
             try:
                 stopped = await _with_timeout(dbg.launch())
             except asyncio.TimeoutError:
+                result.timeout = True
                 stopped = None
             while True:
                 # If terminated, dbg.launch/continue returns EventListView
@@ -252,6 +253,7 @@ try:
                     try:
                         next_view = await _with_timeout(dbg.continue_execution())
                     except asyncio.TimeoutError:
+                        result.timeout = True
                         break
                     stopped = next_view
                     continue
@@ -278,6 +280,7 @@ try:
                         try:
                             next_view = await _with_timeout(dbg.continue_execution())
                         except asyncio.TimeoutError:
+                            result.timeout = True
                             break
                         stopped = next_view
                         continue
@@ -331,6 +334,7 @@ try:
                 try:
                     next_view = await _with_timeout(dbg.continue_execution())
                 except asyncio.TimeoutError:
+                    result.timeout = True
                     break
                 stopped = next_view
 
@@ -512,7 +516,7 @@ try:
             stdin: Optional[bytes] = None,
             timeout_sec: Optional[int] = None,
             breakpoints: Optional[List[Dict[str, Any]]] = None,
-        ) -> Dict[str, Any]:
+        ) -> RuntimeFeedbackV2:
             """Run a program under LLDB DAP and return a summarized report.
 
             - cmd: program argv (first item is the binary)
@@ -536,8 +540,20 @@ try:
                 exit_code=raw.exit_code,
                 signal=raw.signal,
                 breakpoints=list(raw.reports.values()),
+                has_timeout=raw.timeout,
             )
-            return out.model_dump()
+            return out
+
+        def get_runtime_feedback_dict(
+            self,
+            cmd: List[str],
+            stdin: Optional[bytes] = None,
+            timeout_sec: Optional[int] = None,
+            breakpoints: Optional[List[Dict[str, Any]]] = None,
+        ):
+            return self.get_runtime_feedback(
+                cmd, stdin, timeout_sec, breakpoints
+            ).model_dump()
 
 except ImportError as e:
     # Handle missing dependencies gracefully
