@@ -27,7 +27,12 @@ def _can_spawn_adapter() -> bool:
         return False
     try:
         # Try a quick help run to validate sandbox allows exec
-        subprocess.run([adapter, "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+        subprocess.run(
+            [adapter, "--help"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
         return True
     except Exception:
         return False

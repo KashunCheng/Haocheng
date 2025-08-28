@@ -1,11 +1,21 @@
 import pytest
 
 from haocheng import _run_dap, BreakpointSpec
-from tests import _which_lldb_adapter, _can_spawn_adapter, ROOT, _compile_fixture, _parse_int
+from tests import (
+    _which_lldb_adapter,
+    _can_spawn_adapter,
+    ROOT,
+    _compile_fixture,
+    _parse_int,
+)
 
 
-@pytest.mark.skipif(not _which_lldb_adapter(), reason="lldb-dap/lldb-vscode not found in PATH")
-@pytest.mark.skipif(not _can_spawn_adapter(), reason="Sandbox cannot execute lldb adapter")
+@pytest.mark.skipif(
+    not _which_lldb_adapter(), reason="lldb-dap/lldb-vscode not found in PATH"
+)
+@pytest.mark.skipif(
+    not _can_spawn_adapter(), reason="Sandbox cannot execute lldb adapter"
+)
 @pytest.mark.asyncio
 async def test_hit_limit_basic():
     src = ROOT / "fixtures" / "loop_basic.c"
@@ -14,7 +24,9 @@ async def test_hit_limit_basic():
     # Set hit_limit to 2 while the loop iterates 5 times
     loc = f"{src}:6"
     specs = [
-        BreakpointSpec(location=loc, inline_expr=["i", "sum"], hit_limit=2, print_call_stack=True)
+        BreakpointSpec(
+            location=loc, inline_expr=["i", "sum"], hit_limit=2, print_call_stack=True
+        )
     ]
 
     res = await _run_dap([str(bin_path)], None, specs)
@@ -32,4 +44,3 @@ async def test_hit_limit_basic():
     s_vals = [_parse_int(hit.inline_expr[1].value) for hit in bp.hits_info]
     assert i_vals == [0, 1]
     assert s_vals == [0, 0]
-
