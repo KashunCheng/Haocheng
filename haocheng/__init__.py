@@ -6,6 +6,7 @@ try:
     import time
     import os
     import shutil
+    import subprocess
     import tempfile
     from pathlib import Path
     from typing import Any, Dict, List, Tuple, Optional
@@ -23,7 +24,6 @@ try:
         EventListView,
     )
 
-
     class RuntimeFeedback(BaseModel):
         stdout: bytes
         stderr: bytes
@@ -31,7 +31,6 @@ try:
         timeout: bool
         exit_code: Optional[int]
         signal: Optional[str]
-
 
     # New Pydantic models for the updated API schema
     class BreakpointSpec(BaseModel):
@@ -58,16 +57,13 @@ try:
             _, ln = self.location.rsplit(":", 1)
             return int(ln)
 
-
     class InlineExprValue(BaseModel):
         name: str
         value: str
 
-
     class BreakpointHitInfo(BaseModel):
         callstack: str
         inline_expr: list[InlineExprValue]
-
 
     class BreakpointReport(BaseModel):
         id: int
@@ -77,7 +73,6 @@ try:
         hit_times: int
         hits_info: list[BreakpointHitInfo]
 
-
     class RuntimeFeedbackV2(BaseModel):
         """Output schema for run (new format)."""
 
@@ -86,7 +81,6 @@ try:
         signal: Optional[str]
         breakpoints: list[BreakpointReport]
         has_timeout: bool
-
 
     # Locate LLDB's DAP adapter. Prefer an explicit adapter path if provided,
     # otherwise try `lldb-dap` then `lldb-vscode` on PATH.
@@ -106,9 +100,26 @@ try:
                 return cmd, []
         raise RuntimeError("LLDB DAP adapter not found (lldb-dap or lldb-vscode)")
 
+    def _get_source_map(lldb_path: str, executable_path: str) -> list[Path]:
+        llvm_dwarfdump_path = lldb_path.replace("lldb-dap", "llvm-dwarfdump")
+        llvm_dwarfdump_path = llvm_dwarfdump_path.replace(
+            "lldb-vscode", "llvm-dwarfdump"
+        )
+        if not Path(llvm_dwarfdump_path).exists():
+            return []
+        out = subprocess.check_output(
+            [llvm_dwarfdump_path, "--show-sources", executable_path],
+            text=True,
+            errors="ignore",
+        )
+        return [
+            Path(line.strip()).resolve() for line in out.splitlines() if line.strip()
+        ]
 
     def _normalize_locations(
-            breakpoints: List[BreakpointSpec], repo_dir: Optional[Path] = None
+        breakpoints: List[BreakpointSpec],
+        repo_dir: Optional[Path] = None,
+        source_map: Optional[List[Path]] = None,
     ) -> None:
         """Normalize BreakpointSpec locations to absolute file paths in-place.
 
@@ -126,7 +137,11 @@ try:
                 if guess.exists():
                     bp.location = f"{guess}:{line_part}"
                     continue
-
+            if source_map is not None:
+                guess = [p for p in source_map if p.name == file_path.name]
+                if guess:
+                    bp.location = f"{guess[0]}:{line_part}"
+                    continue
 
     def _format_single_frame(frame: StackFrame) -> str:
         return (
@@ -135,7 +150,6 @@ try:
             else frame.name
         )
 
-
     def _compact_backtrace(frames: list[StackFrame]) -> str:
         """Return a compact, multi-line callstack string for the stopped thread."""
         return "\n".join(
@@ -143,15 +157,14 @@ try:
             for i, f in enumerate(frames)
         )
 
-
     async def _run_dap(
-            cmd: List[str],
-            stdin_bytes: Optional[bytes],
-            breakpoints: List[BreakpointSpec],
-            repo_dir: Optional[Path] = None,
-            env: Optional[Dict[str, str]] = None,
-            lldb_path: Optional[Path] = None,
-            timeout_sec: Optional[float] = None,
+        cmd: List[str],
+        stdin_bytes: Optional[bytes],
+        breakpoints: List[BreakpointSpec],
+        repo_dir: Optional[Path] = None,
+        env: Optional[Dict[str, str]] = None,
+        lldb_path: Optional[Path] = None,
+        timeout_sec: Optional[float] = None,
     ) -> RuntimeFeedback:
         # Aggregate results
         result: RuntimeFeedback = RuntimeFeedback(
@@ -213,7 +226,8 @@ try:
 
             await dbg.initialize()
             # Normalize and set breakpoints for all locations provided in specs
-            _normalize_locations(breakpoints, repo_dir)
+            source_map = _get_source_map(adapter_cmd, program)
+            _normalize_locations(breakpoints, repo_dir, source_map)
             id_to_spec: Dict[int, BreakpointSpec] = {}
 
             for spec in breakpoints:
@@ -221,10 +235,14 @@ try:
                     resp = await dbg.set_breakpoint(Path(spec.file_path), spec.line_no)
                     if isinstance(resp, ErrorResponse):
                         # Log the error but don't raise exception - create empty report instead
-                        print(f"Warning: Failed to set breakpoint at {spec.location}: {resp.message}")
+                        print(
+                            f"Warning: Failed to set breakpoint at {spec.location}: {resp.message}"
+                        )
                         continue
                     if not isinstance(resp, SetBreakpointsResponse):
-                        print(f"Warning: Unexpected response type for breakpoint at {spec.location}")
+                        print(
+                            f"Warning: Unexpected response type for breakpoint at {spec.location}"
+                        )
                         continue
                     if not resp.success:
                         print(f"Warning: Failed to set breakpoint at {spec.location}")
@@ -250,7 +268,9 @@ try:
                     )
                 except Exception as e:
                     # Handle any other exceptions gracefully
-                    print(f"Warning: Exception setting breakpoint at {spec.location}: {e}")
+                    print(
+                        f"Warning: Exception setting breakpoint at {spec.location}: {e}"
+                    )
                     continue
 
             # Launch and event loop with timeout tracking
@@ -286,17 +306,19 @@ try:
 
                 # Identify a breakpoint stop
                 breakpoint_event = [
-                    e for e in stopped.events.events
+                    e
+                    for e in stopped.events.events
                     if isinstance(e, StoppedEvent) and e.body.reason == "breakpoint"
                 ]
                 if not breakpoint_event:
                     # Handle non-breakpoint stops (e.g., exception/signals)
                     stopped_event = [
-                        e for e in stopped.events.events
-                        if isinstance(e, StoppedEvent)
+                        e for e in stopped.events.events if isinstance(e, StoppedEvent)
                     ]
                     if len(stopped_event) != 1:
-                        print(f"Warning: Expected 1 stopped event, got {len(stopped_event)}")
+                        print(
+                            f"Warning: Expected 1 stopped event, got {len(stopped_event)}"
+                        )
                         try:
                             next_view = await _with_timeout(dbg.continue_execution())
                         except asyncio.TimeoutError:
@@ -317,7 +339,9 @@ try:
                     result.signal = stopped_event[0].body.description
                     break
                 if len(breakpoint_event) != 1:
-                    print(f"Warning: Expected 1 breakpoint event, got {len(breakpoint_event)}")
+                    print(
+                        f"Warning: Expected 1 breakpoint event, got {len(breakpoint_event)}"
+                    )
                     try:
                         next_view = await _with_timeout(dbg.continue_execution())
                     except asyncio.TimeoutError:
@@ -327,7 +351,7 @@ try:
                     continue
 
                 bp_event = breakpoint_event[0]
-                if not hasattr(bp_event.body, 'hitBreakpointIds'):
+                if not hasattr(bp_event.body, "hitBreakpointIds"):
                     print("Warning: Breakpoint event missing hitBreakpointIds")
                     try:
                         next_view = await _with_timeout(dbg.continue_execution())
@@ -349,12 +373,16 @@ try:
                 for breakpoint_id in breakpoint_ids:
                     spec = id_to_spec.get(breakpoint_id)
                     if spec is None:
-                        print(f"Warning: No spec found for breakpoint ID {breakpoint_id}")
+                        print(
+                            f"Warning: No spec found for breakpoint ID {breakpoint_id}"
+                        )
                         continue
 
                     report = result.reports.get(breakpoint_id)
                     if report is None:
-                        print(f"Warning: No report found for breakpoint ID {breakpoint_id}")
+                        print(
+                            f"Warning: No report found for breakpoint ID {breakpoint_id}"
+                        )
                         continue
                     report.function_name = function_name
                     report.hit_times += 1
@@ -363,10 +391,17 @@ try:
                             response = await dbg.remove_breakpoint(
                                 Path(spec.file_path), spec.line_no
                             )
-                            if not isinstance(response, SetBreakpointsResponse) or not response.success:
-                                print(f"Warning: Failed to remove breakpoint at {spec.location}")
+                            if (
+                                not isinstance(response, SetBreakpointsResponse)
+                                or not response.success
+                            ):
+                                print(
+                                    f"Warning: Failed to remove breakpoint at {spec.location}"
+                                )
                         except Exception as e:
-                            print(f"Warning: Exception removing breakpoint at {spec.location}: {e}")
+                            print(
+                                f"Warning: Exception removing breakpoint at {spec.location}: {e}"
+                            )
 
                     if top.source and top.source.path:
                         report.file_path = top.source.path
@@ -397,35 +432,50 @@ try:
                                 # Use safe attribute access with getattr and default values
                                 val = "<evaluation_failed>"
                                 try:
-                                    success = getattr(ev, 'success', False)
+                                    success = getattr(ev, "success", False)
                                     if success:
-                                        body = getattr(ev, 'body', None)
+                                        body = getattr(ev, "body", None)
                                         if body is not None:
-                                            eval_result = getattr(body, 'result', None)
+                                            eval_result = getattr(body, "result", None)
                                             if eval_result is not None:
                                                 val = str(eval_result)
                                             else:
                                                 val = "<no_result>"
                                     else:
-                                        body = getattr(ev, 'body', None)
+                                        body = getattr(ev, "body", None)
                                         if body is not None:
-                                            error_obj = getattr(body, 'error', None)
+                                            error_obj = getattr(body, "error", None)
                                             if error_obj is not None:
-                                                error_format = getattr(error_obj, 'format', None)
-                                                error_message = getattr(error_obj, 'message', None)
+                                                error_format = getattr(
+                                                    error_obj, "format", None
+                                                )
+                                                error_message = getattr(
+                                                    error_obj, "message", None
+                                                )
                                                 if error_format is not None:
                                                     # Extract the key error message from the format
                                                     error_text = str(error_format)
                                                     # Look for common error patterns and simplify them
-                                                    if "use of undeclared identifier" in error_text:
+                                                    if (
+                                                        "use of undeclared identifier"
+                                                        in error_text
+                                                    ):
                                                         val = f"<use of undeclared identifier '{var}'>"
-                                                    elif "no member named" in error_text:
+                                                    elif (
+                                                        "no member named" in error_text
+                                                    ):
                                                         val = f"<no member named in {var}>"
                                                     elif "cannot be used" in error_text:
                                                         val = f"<{var} cannot be used>"
-                                                    elif "not found" in error_text.lower():
+                                                    elif (
+                                                        "not found"
+                                                        in error_text.lower()
+                                                    ):
                                                         val = f"<{var} not found>"
-                                                    elif "undefined" in error_text.lower():
+                                                    elif (
+                                                        "undefined"
+                                                        in error_text.lower()
+                                                    ):
                                                         val = f"<{var} undefined>"
                                                     else:
                                                         # For other errors, just use a generic message
@@ -456,8 +506,7 @@ try:
 
             if isinstance(stopped, EventListView):
                 exited_events = [
-                    e for e in stopped.events
-                    if isinstance(e, ExitedEvent)
+                    e for e in stopped.events if isinstance(e, ExitedEvent)
                 ]
                 if exited_events:
                     exited_event = exited_events[0]
@@ -482,7 +531,6 @@ try:
                 os.unlink(stderr.name)
             except Exception:
                 pass
-
 
     class RuntimeDebugger:
         """Runtime debugger class for collecting runtime feedback via LLDB DAP."""
@@ -523,8 +571,11 @@ try:
 
             # Load repo_dir
             if config.source_code_dir:
-                path = config.source_code_dir if isinstance(config.source_code_dir, Path) else Path(
-                    config.source_code_dir)
+                path = (
+                    config.source_code_dir
+                    if isinstance(config.source_code_dir, Path)
+                    else Path(config.source_code_dir)
+                )
                 if path.exists() and path.is_dir():
                     self.repo_dir = path
                 else:
@@ -614,11 +665,11 @@ try:
             self._update_path_with_lldb()
 
         async def _run_dap_async(
-                self,
-                cmd: List[str],
-                stdin_bytes: Optional[bytes],
-                breakpoints: List[BreakpointSpec],
-                timeout_sec: Optional[float] = None,
+            self,
+            cmd: List[str],
+            stdin_bytes: Optional[bytes],
+            breakpoints: List[BreakpointSpec],
+            timeout_sec: Optional[float] = None,
         ) -> RuntimeFeedback:
             return await _run_dap(
                 cmd,
@@ -631,11 +682,11 @@ try:
             )
 
         def run(
-                self,
-                cmd: List[str],
-                stdin: Optional[bytes] = None,
-                timeout_sec: Optional[int] = None,
-                breakpoints: Optional[List[Dict[str, Any]]] = None,
+            self,
+            cmd: List[str],
+            stdin: Optional[bytes] = None,
+            timeout_sec: Optional[int] = None,
+            breakpoints: Optional[List[Dict[str, Any]]] = None,
         ) -> RuntimeFeedbackV2:
             """Run a program under LLDB DAP and collect runtime debugging information.
 
@@ -727,11 +778,11 @@ try:
             return out
 
         def run_dict(
-                self,
-                cmd: List[str],
-                stdin: Optional[bytes] = None,
-                timeout_sec: Optional[int] = None,
-                breakpoints: Optional[List[Dict[str, Any]]] = None,
+            self,
+            cmd: List[str],
+            stdin: Optional[bytes] = None,
+            timeout_sec: Optional[int] = None,
+            breakpoints: Optional[List[Dict[str, Any]]] = None,
         ) -> Dict[str, Any]:
             """Run a program under LLDB DAP and return debugging information as a dictionary.
 
@@ -796,9 +847,7 @@ try:
                 due to invalid input. See the run() method documentation for detailed
                 error handling behavior.
             """
-            return self.run(
-                cmd, stdin, timeout_sec, breakpoints
-            ).model_dump()
+            return self.run(cmd, stdin, timeout_sec, breakpoints).model_dump()
 
 except ImportError as e:
     # Handle missing dependencies gracefully
