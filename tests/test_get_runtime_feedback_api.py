@@ -31,9 +31,7 @@ def test_get_runtime_feedback_basic_api():
     ]
 
     dbg = RuntimeDebugger()
-    out = dbg.get_runtime_feedback_dict(
-        [str(bin_path)], stdin=None, breakpoints=breakpoints
-    )
+    out = dbg.run_dict([str(bin_path)], stdin=None, breakpoints=breakpoints)
 
     # Schema checks
     assert isinstance(out, dict)
